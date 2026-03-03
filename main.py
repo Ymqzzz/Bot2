@@ -15,9 +15,9 @@ from sklearn.pipeline import Pipeline
 
 
 # ========= CONFIG =========
-DISCORD_TOKEN = "MTQwNTk0MjM2NDE0ODczMTkyNQ.GFplA8.SRcnS9Tldu5mc_5zc5Y0F_bH7cEa1mc2POPEE4"
-OANDA_API_KEY = "76286dc366f87caf7ee9f163fa8f9e8a-ac7ee2f4dd111169a66aa2e8404b6b69"
-OANDA_ACCOUNTID = "101-001-36108149-001"
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+OANDA_API_KEY = os.environ.get("OANDA_API_KEY", "")
+OANDA_ACCOUNTID = os.environ.get("OANDA_ACCOUNTID", "")
 # Add to your config section
 # Add these missing config variables:
 SHARPE_FLOOR = float(os.environ.get("SHARPE_FLOOR", "-0.50"))  # Sharpe gate floor
@@ -91,6 +91,23 @@ MIN_PLAN_EVR = float(os.environ.get("MIN_PLAN_EVR", "0.05"))
 STRAT_DISABLE_COOLDOWN_MIN = int(os.environ.get("STRAT_DISABLE_COOLDOWN_MIN", "1440"))
 PARTIAL_CLOSE_FRACTION = float(os.environ.get("PARTIAL_CLOSE_FRACTION", "0.4"))
 TIME_STOP_PROGRESS_R = float(os.environ.get("TIME_STOP_PROGRESS_R", "0.5"))
+
+# Director / quota / OpenRouter controls
+TRADE_TARGET_MIN = int(os.environ.get("TRADE_TARGET_MIN", "2"))
+TRADE_TARGET_MAX = int(os.environ.get("TRADE_TARGET_MAX", "3"))
+TRADE_HARD_MAX = int(os.environ.get("TRADE_HARD_MAX", "5"))
+DIRECTOR_TOP_FOCUS = int(os.environ.get("DIRECTOR_TOP_FOCUS", "5"))
+DIRECTOR_TTL_SEC = int(os.environ.get("DIRECTOR_TTL_SEC", "180"))
+DIRECTOR_LLM_INTERVAL_SEC = int(os.environ.get("DIRECTOR_LLM_INTERVAL_SEC", "180"))
+REPLAY_LOG_PATH = os.environ.get("REPLAY_LOG_PATH", "replay_decisions.jsonl")
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "450"))
+OPENROUTER_TIMEOUT_SEC = int(os.environ.get("OPENROUTER_TIMEOUT_SEC", "12"))
+OPENROUTER_COOLDOWN_SEC = int(os.environ.get("OPENROUTER_COOLDOWN_SEC", "120"))
+OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_NAME = os.environ.get("OPENROUTER_APP_NAME", "")
 
 
 # Optional external keys
@@ -216,6 +233,19 @@ recent_plan_ids = {}
 strategy_disable_until = {}
 strategy_stats = defaultdict(lambda: {"n":0, "wins":0, "sum_r":0.0, "last50": deque(maxlen=50)})
 last_tx_seen = None
+director_state = {"ts": 0.0, "decision": None, "cache": {}}
+openrouter_state = {"last_call": 0.0, "cache": {}}
+daily_trade_budget = {
+    "day": None,
+    "trades_opened_today": 0,
+    "trades_closed_today": 0,
+    "opportunities_seen": defaultdict(int),
+    "missed_trades": 0,
+    "mode": "normal",
+    "last_open_ts": 0.0,
+    "consecutive_losses": 0,
+}
+bandit_state = defaultdict(lambda: defaultdict(lambda: {"alpha": 1.0, "beta": 1.0}))
 
 # Analysis / Ops log
 from threading import Lock
@@ -252,6 +282,44 @@ def utc_now_iso():
 def pair_currencies(pair):
     base, quote = pair.split("_")
     return base, quote
+
+def session_label(now=None):
+    now = now or datetime.now(timezone.utc)
+    h = now.hour
+    if 0 <= h < 7:
+        return "ASIA"
+    if 7 <= h < 12:
+        return "LONDON"
+    if 12 <= h < 17:
+        return "OVERLAP"
+    if 17 <= h < 21:
+        return "NY"
+    return "DEAD_ZONE"
+
+
+def reset_daily_trade_budget_if_needed():
+    d = datetime.now(timezone.utc).date().isoformat()
+    if daily_trade_budget.get("day") != d:
+        daily_trade_budget["day"] = d
+        daily_trade_budget["trades_opened_today"] = 0
+        daily_trade_budget["trades_closed_today"] = 0
+        daily_trade_budget["opportunities_seen"] = defaultdict(int)
+        daily_trade_budget["missed_trades"] = 0
+        daily_trade_budget["mode"] = "normal"
+        daily_trade_budget["consecutive_losses"] = 0
+
+
+def replay_log(payload):
+    try:
+        with open(REPLAY_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"Replay log write failed: {e}")
+
+
+def clamp01(x):
+    return float(np.clip(float(x), 0.0, 1.0))
+
 
 # ========= ANALYSIS LOG HELPERS =========
 def log_event(kind: str, instr: str = None, msg: str = "", data: dict = None, level: int = 1):
@@ -502,7 +570,22 @@ def summary_json():
         return jsonify({"enabled": False, "plain": "", "pretty": ""})
     plain = build_plain_summary()
     pretty = llm_rewrite_summary(plain)
-    return jsonify({"enabled": True, "plain": plain, "pretty": pretty})
+    decision = director_state.get("decision") or {}
+    bandit_view = {s: {k: round(v["alpha"] / (v["alpha"] + v["beta"]), 3) for k, v in arms.items()} for s, arms in bandit_state.items()}
+    return jsonify({
+        "enabled": True,
+        "plain": plain,
+        "pretty": pretty,
+        "director_selected": decision.get("focus", []),
+        "trade_budget": {
+            "target": [TRADE_TARGET_MIN, TRADE_TARGET_MAX],
+            "actual": daily_trade_budget.get("trades_opened_today", 0),
+            "max": TRADE_HARD_MAX,
+            "mode": daily_trade_budget.get("mode", "normal"),
+        },
+        "bandit_weights": bandit_view,
+        "top_opportunity": sorted([(i, (signal_cache.get(i, {}) or {}).get("opportunity_score", 0.0)) for i in INSTRUMENTS], key=lambda x: x[1], reverse=True)[:5],
+    })
 
 
 def run_flask():
@@ -1413,6 +1496,369 @@ def classify_regime_mode(regime_k, reg_intraday, atr_val, price):
     return "range"
 
 
+STRATEGY_CATALOG = {
+    "BREAKOUT_SQUEEZE": {
+        "impl": "Squeeze-Breakout",
+        "sessions": {"LONDON", "NY", "OVERLAP"},
+        "liquidity_min": 0.45,
+        "regimes": {"trend", "high_vol"},
+        "min_opportunity": 0.45,
+        "fallback_exit": {"time_stop": TIME_STOP_BARS // 2, "trail": "atr"},
+        "freq": "medium",
+    },
+    "TREND_PULLBACK": {
+        "impl": "Trend-Pullback",
+        "sessions": {"LONDON", "NY", "OVERLAP", "late_london"},
+        "liquidity_min": 0.35,
+        "regimes": {"trend", "high_vol"},
+        "min_opportunity": 0.40,
+        "fallback_exit": {"time_stop": TIME_STOP_BARS, "trail": "ema20"},
+        "freq": "medium",
+    },
+    "RANGE_MEANREV": {
+        "impl": "Range-MeanReversion",
+        "sessions": {"ASIA", "DEAD_ZONE", "LONDON"},
+        "liquidity_min": 0.30,
+        "regimes": {"range", "low_vol"},
+        "min_opportunity": 0.35,
+        "fallback_exit": {"time_stop": TIME_STOP_BARS, "trail": "none"},
+        "freq": "high",
+    },
+    "LIQUIDITY_SWEEP_REVERSAL": {
+        "impl": "Liquidity-Sweep-Reversal",
+        "sessions": {"ASIA", "LONDON", "NY", "OVERLAP"},
+        "liquidity_min": 0.35,
+        "regimes": {"range", "neutral", "low_vol"},
+        "min_opportunity": 0.40,
+        "fallback_exit": {"time_stop": TIME_STOP_BARS, "trail": "swing"},
+        "freq": "low",
+    },
+}
+
+STRATEGY_IMPL_TO_CODE = {v["impl"]: k for k, v in STRATEGY_CATALOG.items()}
+
+
+def strategy_code_to_impl(code):
+    return (STRATEGY_CATALOG.get(code) or {}).get("impl", code)
+
+
+def strategy_impl_to_code(name):
+    return STRATEGY_IMPL_TO_CODE.get(name, name)
+
+
+def build_world_state(top_n=12):
+    reset_daily_trade_budget_if_needed()
+    refresh_pricing_once()
+    nav, ccy = get_nav()
+    open_positions = get_positions_info()
+    var_est = portfolio_var(price_cache, horizon_days=1, cl=0.99)
+    session = session_label()
+    top = []
+    by_instr = {}
+    for ins in INSTRUMENTS:
+        snap = build_market_snapshot(ins)
+        if not snap:
+            continue
+        rv_short = float(snap["dfs"]["M5"]["c"].pct_change().rolling(20).std().iloc[-1] or 0.0)
+        rv_long = float(snap["dfs"]["M5"]["c"].pct_change().rolling(200).std().iloc[-1] or 0.0)
+        range_score = clamp01(1.0 - min(1.0, abs(snap["zscore"]) / 2.5))
+        comp = float(snap.get("compression", 0.0))
+        walls = snap.get("lux", {}).get("lux_meta", {})
+        above = walls.get("above", [])
+        below = walls.get("below", [])
+        wall_above = float(above[0]["score"]) if above else 0.0
+        wall_below = float(below[0]["score"]) if below else 0.0
+        event_level = 1.0 if snap.get("event_block") else 0.0
+        opp = clamp01(abs(snap.get("breakout", {}).get("mag", 0.0)) * 0.35 + abs(snap.get("zscore", 0.0))/3.0 * 0.25 + comp * 0.2 + abs(snap.get("lux", {}).get("lux_draw", 0.0))*0.2)
+        top.append((ins, opp))
+        by_instr[ins] = {
+            "realized_vol_short": rv_short,
+            "realized_vol_long": rv_long,
+            "trend_strength": abs(float(snap.get("htf_align", 0.0))),
+            "range_score": range_score,
+            "compression_score": comp,
+            "liquidity_factor": float(snap.get("liq_factor", 0.5)),
+            "spread_percentile": float(snap.get("spread_info", {}).get("percentile", 50.0)),
+            "tick_staleness": 1.0 if snap.get("spread_info", {}).get("stale") else 0.0,
+            "wall_above_strength": wall_above,
+            "wall_below_strength": wall_below,
+            "session": session,
+            "event_risk_level": event_level,
+            "regime": snap.get("mode", "neutral"),
+            "opportunity_score": opp,
+            "snapshot": snap,
+        }
+    top = sorted(top, key=lambda x: x[1], reverse=True)
+    top_instr = [k for k, _ in top[:top_n]]
+    return {
+        "ts": utc_now_iso(),
+        "session": session,
+        "market": {k: by_instr[k] for k in top_instr if k in by_instr},
+        "portfolio": {
+            "open_positions_count": len(open_positions),
+            "portfolio_heat": current_portfolio_heat(nav),
+            "currency_exposure": currency_exposure_map(),
+            "trade_count_today": daily_trade_budget.get("trades_opened_today", 0),
+            "realized_pnl_today": compute_day_realized_pnl(),
+            "expectancy_proxy_7d": strategy_sharpe(),
+            "var99": float(var_est.get("param", 0.0)),
+            "nav": nav,
+            "ccy": ccy,
+        },
+    }
+
+
+def build_world_state_compact(world_state=None, top_n=10):
+    ws = world_state or build_world_state(top_n=top_n)
+    focus = sorted(ws["market"].items(), key=lambda kv: kv[1].get("opportunity_score", 0.0), reverse=True)[:top_n]
+    events = fetch_econ_calendar() or []
+    high_events = []
+    now = datetime.now(timezone.utc)
+    for e in events:
+        if e.get("impact") != "High":
+            continue
+        when = e.get("time")
+        mins = 9999
+        if isinstance(when, datetime):
+            mins = int((when - now).total_seconds() / 60)
+        high_events.append({"currency": e.get("currency"), "event": e.get("event"), "mins": mins})
+        if len(high_events) >= 5:
+            break
+    compact = {
+        "timestamp": ws["ts"],
+        "session": ws["session"],
+        "trade_budget": {
+            "trades_opened_today": daily_trade_budget.get("trades_opened_today", 0),
+            "target_min": TRADE_TARGET_MIN,
+            "target_max": TRADE_TARGET_MAX,
+            "max_today": TRADE_HARD_MAX,
+        },
+        "portfolio": {
+            "heat": round(ws["portfolio"].get("portfolio_heat", 0.0), 4),
+            "var_gate": ws["portfolio"].get("var99", 0.0) <= VAR_LIMIT_PCT,
+            "exposure_highlights": sorted(ws["portfolio"].get("currency_exposure", {}).items(), key=lambda x: abs(x[1]), reverse=True)[:2],
+        },
+        "events": high_events,
+        "instruments": {},
+    }
+    for ins, m in focus:
+        compact["instruments"][ins] = {
+            "price": round(float(m["snapshot"]["mid"]), 5),
+            "spread_pctile": round(float(m.get("spread_percentile", 50.0)), 2),
+            "liquidity_factor": round(float(m.get("liquidity_factor", 0.5)), 3),
+            "regime": m.get("regime", "neutral"),
+            "compression_score": round(float(m.get("compression_score", 0.0)), 3),
+            "breakout_mag": round(float(m["snapshot"].get("breakout", {}).get("mag", 0.0)), 3),
+            "htf_align": round(float(m["snapshot"].get("htf_align", 0.0)), 3),
+            "lux_draw": round(float(m["snapshot"].get("lux", {}).get("lux_draw", 0.0)), 3),
+            "crowding_strength": round(float(m["snapshot"].get("pos_book", {}).get("crowding", 0.0)), 3),
+            "recent_strategy_results": {
+                k: round(float(np.mean(list(v)[-10:])) if len(v) else 0.0, 3) for k, v in strategy_perf.items()
+            },
+        }
+    return compact
+
+
+def score_strategy_for_market(code, market, session):
+    snap = market["snapshot"]
+    comp = market.get("compression_score", 0.0)
+    trend = market.get("trend_strength", 0.0)
+    liq = market.get("liquidity_factor", 0.5)
+    range_score = market.get("range_score", 0.0)
+    lux = abs(float(snap.get("lux", {}).get("lux_draw", 0.0)))
+    breakout = abs(float(snap.get("breakout", {}).get("mag", 0.0)))
+    crowd = abs(float(snap.get("pos_book", {}).get("crowding", 0.0)))
+    vol_ratio = market.get("realized_vol_short", 0.0) / (market.get("realized_vol_long", 1e-9) + 1e-9)
+
+    if code == "BREAKOUT_SQUEEZE":
+        return 0.30 * comp + 0.20 * min(1.0, breakout) + 0.20 * trend + 0.20 * liq + (0.10 if session in {"LONDON", "NY", "OVERLAP"} else 0.0) + 0.10 * min(1.0, vol_ratio)
+    if code == "TREND_PULLBACK":
+        pullback = 1.0 - min(1.0, abs((snap.get("mid", 0.0) - snap.get("ema20", 0.0)) / (snap.get("atr", 1e-9) + 1e-9)) / 2.0)
+        return 0.35 * trend + 0.25 * pullback + 0.20 * liq + 0.20 * market.get("opportunity_score", 0.0)
+    if code == "RANGE_MEANREV":
+        mixed = 1.0 - trend
+        return 0.35 * range_score + 0.25 * mixed + 0.20 * max(0.0, 1.0 - vol_ratio) + 0.20 * (0.8 if session == "ASIA" else 0.4)
+    if code == "LIQUIDITY_SWEEP_REVERSAL":
+        walls = clamp01(market.get("wall_above_strength", 0.0) + market.get("wall_below_strength", 0.0))
+        return 0.35 * lux + 0.25 * walls + 0.20 * crowd + 0.20 * range_score
+    return 0.0
+
+
+def sample_bandit_weight(session, strategy_code):
+    arm = bandit_state[session][strategy_code]
+    return float(np.random.beta(arm["alpha"], arm["beta"]))
+
+
+def update_bandit_reward(session, strategy_code, reward_r):
+    arm = bandit_state[session][strategy_code]
+    r = float(np.clip(reward_r, -1.0, 1.0))
+    p = (r + 1.0) / 2.0
+    arm["alpha"] += p
+    arm["beta"] += (1.0 - p)
+
+
+def build_deterministic_director_decision(world_state):
+    decision = {"focus": [], "quota_plan": {"mode": "normal", "notes": ""}, "global_notes": []}
+    session = world_state["session"]
+    for ins, market in world_state["market"].items():
+        scores = {}
+        for code, cfg in STRATEGY_CATALOG.items():
+            if session not in cfg["sessions"] and not (session == "LONDON" and "late_london" in cfg["sessions"]):
+                continue
+            if market["liquidity_factor"] < cfg["liquidity_min"]:
+                continue
+            if market["regime"] not in cfg["regimes"]:
+                continue
+            rule = score_strategy_for_market(code, market, session)
+            band = sample_bandit_weight(session, code)
+            final = rule * (0.7 + 0.3 * band)
+            if final >= cfg["min_opportunity"]:
+                scores[code] = {"rule": rule, "bandit": band, "final": final}
+        ranked = sorted(scores.items(), key=lambda kv: kv[1]["final"], reverse=True)
+        if not ranked:
+            continue
+        selected = [r[0] for r in ranked[:2]]
+        raw = [max(1e-6, ranked[i][1]["final"]) for i in range(len(selected))]
+        tot = sum(raw)
+        weights = {selected[i]: raw[i] / tot for i in range(len(selected))}
+        decision["focus"].append({
+            "instrument": ins,
+            "strategies": selected,
+            "strategy_weights": weights,
+            "priority": clamp01(ranked[0][1]["final"]),
+            "confidence": clamp01(np.mean([x[1]["final"] for x in ranked[:2]])),
+            "reasons": [f"{k}:{round(v['final'],3)}" for k, v in ranked[:3]],
+        })
+    decision["focus"] = sorted(decision["focus"], key=lambda x: x["priority"], reverse=True)
+    decision["focus"] = decision["focus"][:DIRECTOR_TOP_FOCUS]
+    opened = daily_trade_budget.get("trades_opened_today", 0)
+    mode = "normal"
+    if opened < TRADE_TARGET_MIN and datetime.now(timezone.utc).hour >= 12:
+        mode = "expand_breadth"
+        if datetime.now(timezone.utc).hour >= 16 and opened == 0:
+            mode = "scalp_mode"
+    decision["quota_plan"] = {"mode": mode, "notes": "ladder_breadth_only"}
+    return decision
+
+
+def currency_exposure_map():
+    nav, _ = get_nav()
+    expo = defaultdict(float)
+    for ins in INSTRUMENTS:
+        b, q = pair_currencies(ins)
+        px = float(price_cache.get(ins, 0.0) or 0.0)
+        for t in get_open_trades(ins):
+            u = float(t.get("currentUnits", 0.0) or 0.0)
+            notion = abs(u * px)
+            sign = 1.0 if u > 0 else -1.0
+            expo[b] += sign * notion
+            expo[q] -= sign * notion
+    if nav <= 0:
+        return dict(expo)
+    return {k: v / nav for k, v in expo.items()}
+
+
+def compute_day_realized_pnl():
+    tx = safe_get(f"{HOST}/accounts/{OANDA_ACCOUNTID}/transactions") or {}
+    rows = [t for t in tx.get("transactions", []) if t.get("type") == "ORDER_FILL"]
+    if not rows:
+        return 0.0
+    now = datetime.now(timezone.utc).date().isoformat()
+    total = 0.0
+    for t in rows[-300:]:
+        ts = (t.get("time") or "")[:10]
+        if ts != now:
+            continue
+        total += float(t.get("pl", 0.0) or 0.0)
+    return total
+
+
+def openrouter_headers():
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
+    return headers
+
+
+async def openrouter_chat(messages, cache_key):
+    if not OPENROUTER_API_KEY:
+        return None
+    now = time.time()
+    c = openrouter_state["cache"].get(cache_key)
+    if c and now - c["ts"] < 120:
+        return c["data"]
+    if now - openrouter_state.get("last_call", 0.0) < OPENROUTER_COOLDOWN_SEC:
+        return None
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": OPENROUTER_MAX_TOKENS,
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    for _ in range(2):
+        try:
+            resp = await asyncio.to_thread(requests.post, url, headers=openrouter_headers(), data=json.dumps(payload), timeout=OPENROUTER_TIMEOUT_SEC)
+            openrouter_state["last_call"] = time.time()
+            if resp.status_code >= 400:
+                continue
+            j = resp.json()
+            content = (((j.get("choices") or [{}])[0].get("message") or {}).get("content") or "{}")
+            data = json.loads(content)
+            openrouter_state["cache"][cache_key] = {"ts": time.time(), "data": data}
+            return data
+        except Exception:
+            continue
+    return None
+
+
+def validate_llm_decision(data, allowed_instruments):
+    if not isinstance(data, dict):
+        return None
+    out = {"focus": [], "quota_plan": {"mode": "normal", "notes": ""}, "global_notes": []}
+    mode = ((data.get("quota_plan") or {}).get("mode") or "normal")
+    if mode not in {"normal", "expand_breadth", "scalp_mode"}:
+        mode = "normal"
+    out["quota_plan"] = {"mode": mode, "notes": str((data.get("quota_plan") or {}).get("notes") or "")[:120]}
+    for item in (data.get("focus") or [])[:5]:
+        ins = item.get("instrument")
+        if ins not in allowed_instruments:
+            continue
+        strats = [s for s in (item.get("strategies") or []) if s in STRATEGY_CATALOG][:2]
+        if not strats:
+            continue
+        out["focus"].append({
+            "instrument": ins,
+            "strategies": strats,
+            "priority": clamp01(item.get("priority", 0.5)),
+            "confidence": clamp01(item.get("confidence", 0.5)),
+            "reasons": [str(r)[:40] for r in (item.get("reasons") or [])[:5]],
+        })
+    out["global_notes"] = [str(x)[:60] for x in (data.get("global_notes") or [])[:5]]
+    return out
+
+
+async def maybe_llm_director(world_state, deterministic):
+    compact = build_world_state_compact(world_state)
+    payload = json.dumps(compact, sort_keys=True)
+    key = hashlib.sha1((payload + str(daily_trade_budget.get("trades_opened_today", 0)) + world_state["session"]).encode()).hexdigest()[:18]
+    msgs = [
+        {"role": "system", "content": "You are a strategy director. Choose strategies, not trades. Return JSON only in exact schema. Never override risk gates."},
+        {"role": "user", "content": json.dumps({"world_state": compact, "allowed_strategies": list(STRATEGY_CATALOG.keys()), "rules": "Aim for 2-3 trades/day via best setups; if low opportunity choose expand_breadth."})},
+    ]
+    llm = await openrouter_chat(msgs, key)
+    valid = validate_llm_decision(llm, set(world_state["market"].keys())) if llm else None
+    if valid:
+        return valid, True
+    return deterministic, False
+
+
 def strategy_candidates(instr, df, sigs, score):
     direction = 1 if score >= 0 else -1
     rev_dir = -1 if sigs.get("meanrev", 0.0) > 0 else 1
@@ -1741,9 +2187,19 @@ def strategy_liquidity_sweep(snapshot):
     return make_trade_plan(snapshot["instrument"], "Liquidity-Sweep-Reversal", "BUY" if side > 0 else "SELL", "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"lux_draw": draw})
 
 
-def candidate_plans_from_snapshot(snapshot):
+def candidate_plans_from_snapshot(snapshot, allowed_impl=None):
     cands = []
-    for fn in [strategy_trend_pullback, strategy_squeeze_breakout, strategy_range_mean_reversion, strategy_liquidity_sweep]:
+    fn_map = {
+        "Trend-Pullback": strategy_trend_pullback,
+        "Squeeze-Breakout": strategy_squeeze_breakout,
+        "Range-MeanReversion": strategy_range_mean_reversion,
+        "Liquidity-Sweep-Reversal": strategy_liquidity_sweep,
+    }
+    selected = allowed_impl or list(fn_map.keys())
+    for name in selected:
+        fn = fn_map.get(name)
+        if not fn:
+            continue
         try:
             p = fn(snapshot)
             if p:
@@ -1754,6 +2210,11 @@ def candidate_plans_from_snapshot(snapshot):
 
 
 def plan_passes_gates(plan, snapshot):
+    if daily_trade_budget.get("trades_opened_today", 0) >= TRADE_HARD_MAX:
+        return False, "DailyMax"
+    chop = snapshot.get("atr_pct", 0.0) < 0.0015 and abs(snapshot.get("htf_align", 0.0)) < 0.2 and snapshot.get("spread_info", {}).get("percentile", 50) > 80
+    if chop and "Range" not in plan.get("strategy", ""):
+        return False, "Chop"
     if plan["rr"] < MIN_PLAN_RR:
         return False, "RR"
     if plan["ev_r"] < MIN_PLAN_EVR:
@@ -1766,8 +2227,8 @@ def plan_passes_gates(plan, snapshot):
     return True, "OK"
 
 
-def strategy_router(instr, snapshot):
-    plans = candidate_plans_from_snapshot(snapshot)
+def strategy_router(instr, snapshot, allowed_impl=None):
+    plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
     debug = []
     survivors = []
     for p in plans:
@@ -1828,6 +2289,10 @@ def risk_approve_and_size(plan, snapshot):
     direction = 1 if plan["side"] == "BUY" else -1
     units = units_from_risk(plan["instrument"], snapshot["mid"], snapshot["atr"], direction)
     conf_mult = 0.6 + 0.8 * plan["confidence"]
+    if daily_trade_budget.get("consecutive_losses", 0) >= 3:
+        if plan.get("confidence", 0.0) < 0.65:
+            return None, {"blocked": "revenge_filter", "loss_streak": daily_trade_budget.get("consecutive_losses", 0)}
+        conf_mult *= 0.65
     regime_mult = 0.6 if snapshot["mode"] == "high_vol" else 1.0
     corr_pen = max(0.4, 1.0 - min(0.6, cluster * 10.0))
     units = int(units * conf_mult * regime_mult * corr_pen * snapshot.get("risk_mult", 1.0))
@@ -1903,6 +2368,13 @@ def update_strategy_performance_from_fills():
         s["sum_r"] += r
         s["last50"].append(r)
         strategy_perf[strat].append(r)
+        daily_trade_budget["trades_closed_today"] = daily_trade_budget.get("trades_closed_today", 0) + 1
+        if pl <= 0:
+            daily_trade_budget["consecutive_losses"] = daily_trade_budget.get("consecutive_losses", 0) + 1
+        else:
+            daily_trade_budget["consecutive_losses"] = 0
+        sess = session_label()
+        update_bandit_reward(sess, strategy_impl_to_code(strat), r)
 
         if len(s["last50"]) >= RISK_CUTOFF_EXPECTANCY_TRADES and float(np.mean(s["last50"])) < 0:
             strategy_disable_until[strat] = time.time() + STRAT_DISABLE_COOLDOWN_MIN * 60
@@ -2925,7 +3397,7 @@ async def fibplan_cmd(ctx, instrument: str):
 
 # ========= TRADING LOGIC =========
 
-async def trade_once(instr):
+async def trade_once(instr, director_item=None, world_state=None):
     try:
         snapshot = build_market_snapshot(instr)
         if not snapshot:
@@ -2937,13 +3409,18 @@ async def trade_once(instr):
             log_event("RISK", instr, "Daily kill switch active", kill_diag, level=1)
             return
 
-        # one plan max per instrument per cycle by design
-        plan, candidates = strategy_router(instr, snapshot)
-        latest_plan_cache[instr] = {"snapshot_regime": snapshot["regime"], "candidates": candidates, "selected": plan}
+        allowed_codes = (director_item or {}).get("strategies") or list(STRATEGY_CATALOG.keys())
+        allowed_impl = [strategy_code_to_impl(c) for c in allowed_codes]
+
+        # multi-strategy proposals per instrument from selected strategy set
+        plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
+        latest_plan_cache[instr] = {"snapshot_regime": snapshot["regime"], "candidates": candidates, "selected": plan, "director": director_item}
+        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": candidates, "selected": plan})
 
         if not plan:
-            log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"]}, level=1)
-            set_cache(instr, {"score": 0.0, "regime": snapshot["regime"], "strategy": "NONE", "plan": None}, snapshot["mid"])
+            daily_trade_budget["missed_trades"] = daily_trade_budget.get("missed_trades", 0) + 1
+            log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"], "director": director_item}, level=1)
+            set_cache(instr, {"score": 0.0, "regime": snapshot["regime"], "strategy": "NONE", "plan": None, "opportunity_score": float((world_state or {}).get("market", {}).get(instr, {}).get("opportunity_score", 0.0))}, snapshot["mid"])
             return
 
         approved_plan, risk_diag = risk_approve_and_size(plan, snapshot)
@@ -2962,6 +3439,7 @@ async def trade_once(instr):
                 "rr": round(float(approved_plan.get("rr", 0.0)), 3),
                 "entry_type": approved_plan["order_type"],
                 "plan": approved_plan,
+                "opportunity_score": float((world_state or {}).get("market", {}).get(instr, {}).get("opportunity_score", 0.0)),
             },
             snapshot["mid"],
         )
@@ -2977,6 +3455,8 @@ async def trade_once(instr):
             trade_opened = (fill.get("tradeOpened") or {})
             trade_id = trade_opened.get("tradeID")
         if trade_id:
+            daily_trade_budget["trades_opened_today"] = daily_trade_budget.get("trades_opened_today", 0) + 1
+            daily_trade_budget["last_open_ts"] = time.time()
             trade_entry_meta[trade_id] = {
                 "ts": time.time(),
                 "strategy": approved_plan["strategy"],
@@ -2999,6 +3479,7 @@ async def trade_once(instr):
         )
 
         log_event("ORDER", instr, "Executed plan", {"strategy": approved_plan["strategy"], "type": approved_plan["order_type"], "units": approved_plan["units"], **exec_diag}, level=1)
+        replay_log({"ts": utc_now_iso(), "type": "execution", "instrument": instr, "plan": approved_plan, "exec": exec_diag})
 
     except Exception as e:
         logger.exception(f"trade_once error {instr}: {e}")
@@ -3021,8 +3502,37 @@ async def auto_trader():
             # except Exception:
             #     pass
 
-            # 1) Run strategy for all instruments in parallel
-            tasks = [trade_once(instr) for instr in INSTRUMENTS]
+            # 1) Build world-state and director decision
+            try:
+                world_state = build_world_state(top_n=12)
+                deterministic = build_deterministic_director_decision(world_state)
+                heatmap = sorted([(i, m.get("opportunity_score", 0.0)) for i, m in world_state.get("market", {}).items()], key=lambda x: x[1], reverse=True)[:10]
+                log_event("INFO", None, "Opportunity heatmap", {"top10": heatmap}, level=2)
+                decision, from_llm = await maybe_llm_director(world_state, deterministic)
+                director_state["decision"] = decision
+                director_state["ts"] = time.time()
+                mode = decision.get("quota_plan", {}).get("mode", "normal")
+                if mode == "scalp_mode":
+                    liq_ok = world_state["session"] in {"LONDON", "NY", "OVERLAP"} and all(m["liquidity_factor"] > 0.55 for m in world_state["market"].values())
+                    if not liq_ok:
+                        mode = "expand_breadth"
+                daily_trade_budget["mode"] = mode
+                focus = decision.get("focus", [])
+                if mode == "expand_breadth":
+                    extra = sorted(world_state["market"].items(), key=lambda x: x[1].get("opportunity_score", 0.0), reverse=True)[:8]
+                    seen = {f["instrument"] for f in focus}
+                    for ins, _ in extra:
+                        if ins in seen:
+                            continue
+                        focus.append({"instrument": ins, "strategies": list(STRATEGY_CATALOG.keys())[:2], "priority": 0.3, "confidence": 0.4, "reasons": ["quota_expand"]})
+                replay_log({"ts": utc_now_iso(), "type": "director", "from_llm": from_llm, "decision": decision, "session": world_state["session"]})
+            except Exception:
+                logger.exception("director build error")
+                focus = [{"instrument": i, "strategies": list(STRATEGY_CATALOG.keys())[:2]} for i in INSTRUMENTS[:DIRECTOR_TOP_FOCUS]]
+                world_state = None
+
+            # 2) Run focused instruments in parallel
+            tasks = [trade_once(item["instrument"], director_item=item, world_state=world_state) for item in focus]
             try:
                 await asyncio.gather(*tasks)
             except Exception:
