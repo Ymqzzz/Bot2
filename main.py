@@ -86,6 +86,12 @@ DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.02"))
 DAILY_DD_KILL_PCT = float(os.environ.get("DAILY_DD_KILL_PCT", "0.015"))
 TIME_STOP_BARS = int(os.environ.get("TIME_STOP_BARS", "18"))
 RISK_CUTOFF_EXPECTANCY_TRADES = int(os.environ.get("RISK_CUTOFF_EXPECTANCY_TRADES", "30"))
+MIN_PLAN_RR = float(os.environ.get("MIN_PLAN_RR", "1.25"))
+MIN_PLAN_EVR = float(os.environ.get("MIN_PLAN_EVR", "0.05"))
+STRAT_DISABLE_COOLDOWN_MIN = int(os.environ.get("STRAT_DISABLE_COOLDOWN_MIN", "1440"))
+PARTIAL_CLOSE_FRACTION = float(os.environ.get("PARTIAL_CLOSE_FRACTION", "0.4"))
+TIME_STOP_PROGRESS_R = float(os.environ.get("TIME_STOP_PROGRESS_R", "0.5"))
+
 
 # Optional external keys
 TRADING_ECON_KEY = os.environ.get("TRADING_ECON_KEY", "")
@@ -205,6 +211,12 @@ strategy_perf = defaultdict(lambda: deque(maxlen=200))
 trade_entry_meta = {}
 feature_attribution_log = deque(maxlen=5000)
 daily_risk_state = {"day": None, "start_nav": None, "peak_nav": None, "kill": False}
+latest_plan_cache = {}
+recent_plan_ids = {}
+strategy_disable_until = {}
+strategy_stats = defaultdict(lambda: {"n":0, "wins":0, "sum_r":0.0, "last50": deque(maxlen=50)})
+last_tx_seen = None
+
 # Analysis / Ops log
 from threading import Lock
 analysis_log = deque(maxlen=LOG_MAX)
@@ -594,13 +606,15 @@ def record_pnl_snapshot(path="pnl_history.csv"):
         pass
 
 def manage_active_trades(instr, sl_buffer=0.04):
-    """Advanced management: 1R BE move, 1.5R partial, time-stop and opposite-signal exit."""
+    """State-driven lifecycle manager: +1R BE, +1.5R partial, ATR trail, time-stop, invalidation exit."""
     trades = get_open_trades(instr)
     if not trades:
         return
 
     latest_sig = signal_cache.get(instr, {}) if isinstance(signal_cache.get(instr), dict) else {}
     flip_score = float(latest_sig.get("score", 0.0) or 0.0)
+    votes, _ = mtf_direction_vote(instr)
+    h1_vote = votes.get("H1", 0)
 
     for t in trades:
         tid = t.get("id")
@@ -615,8 +629,9 @@ def manage_active_trades(instr, sl_buffer=0.04):
         risk_per_unit = max(abs(ep - sl), 1e-9)
         r_mult = ((mid - ep) / risk_per_unit) if side > 0 else ((ep - mid) / risk_per_unit)
 
-        meta = trade_entry_meta.setdefault(tid, {"ts": time.time(), "be_moved": False, "partial_taken": False})
+        meta = trade_entry_meta.setdefault(tid, {"ts": time.time(), "be_moved": False, "partial_taken": False, "time_stop_bars": TIME_STOP_BARS})
         bars_open = (time.time() - meta["ts"]) / max(COOLDOWN_SEC, 1)
+        time_stop_bars = int(meta.get("time_stop_bars", TIME_STOP_BARS) or TIME_STOP_BARS)
 
         if (not meta["be_moved"]) and r_mult >= 1.0 and t.get("stopLossOrder", {}).get("id"):
             new_sl = ep + sl_buffer * risk_per_unit if side > 0 else ep - sl_buffer * risk_per_unit
@@ -628,19 +643,34 @@ def manage_active_trades(instr, sl_buffer=0.04):
             log_event("MANAGE", instr, f"{tid}: SL -> BE+buffer at +1R", {"new_sl": new_sl}, level=1)
 
         if (not meta["partial_taken"]) and r_mult >= 1.5:
-            cut_units = -int(math.copysign(max(1, int(units_abs * 0.4)), side))
+            cut_units = -int(math.copysign(max(1, int(units_abs * PARTIAL_CLOSE_FRACTION)), side))
             place_market_order(instr, cut_units)
             meta["partial_taken"] = True
             log_event("MANAGE", instr, f"{tid}: partial take at +1.5R", {"cut_units": cut_units}, level=1)
 
-        if bars_open >= TIME_STOP_BARS and r_mult < 0.5:
+        # trailing after partial: ATR based
+        if meta.get("partial_taken") and t.get("stopLossOrder", {}).get("id"):
+            df = get_candles(instr, count=120, granularity="M5")
+            if df is not None and len(df) > 30:
+                atrv = float(atr(df, ATR_PERIOD).iloc[-1] or 0.0)
+                trail_sl = mid - 1.2 * atrv if side > 0 else mid + 1.2 * atrv
+                if (side > 0 and trail_sl > sl) or (side < 0 and trail_sl < sl):
+                    safe_put(
+                        f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders/{t['stopLossOrder']['id']}",
+                        json_data={"order": {"price": f"{_round_price(instr, trail_sl)}"}},
+                    )
+                    log_event("MANAGE", instr, f"{tid}: ATR trail", {"trail_sl": trail_sl}, level=2)
+
+        if bars_open >= time_stop_bars and r_mult < TIME_STOP_PROGRESS_R:
             place_market_order(instr, -side)
             log_event("MANAGE", instr, f"{tid}: time-stop exit", {"bars_open": bars_open, "r": r_mult}, level=1)
             continue
 
-        if (side > 0 and flip_score <= -0.5) or (side < 0 and flip_score >= 0.5):
+        invalidation = (side > 0 and h1_vote < 0) or (side < 0 and h1_vote > 0)
+        if invalidation or (side > 0 and flip_score <= -0.5) or (side < 0 and flip_score >= 0.5):
             place_market_order(instr, -side)
-            log_event("MANAGE", instr, f"{tid}: opposite-signal exit", {"score": flip_score}, level=1)
+            log_event("MANAGE", instr, f"{tid}: invalidation/opposite exit", {"score": flip_score, "h1": h1_vote}, level=1)
+
 
 def safe_put(url, json_data=None, retries=3):
     for _ in range(retries):
@@ -1493,6 +1523,9 @@ def idea_dedup_block(instr, direction):
 
 
 def strategy_enabled(name):
+    until = float(strategy_disable_until.get(name, 0.0) or 0.0)
+    if time.time() < until:
+        return False
     perf = strategy_perf[name]
     if len(perf) < RISK_CUTOFF_EXPECTANCY_TRADES:
         return True
@@ -1562,6 +1595,319 @@ def log_feature_attribution(instr, strategy_name, regime_mode, entry_type, score
         "lux_draw": float(sigs.get("lux_draw", 0.0)),
     })
 
+
+def make_trade_plan(instrument, strategy, side, order_type, entry, sl, tp, time_stop_bars, confidence, pwin, ev_r, validity_sec, metadata=None):
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    return {
+        "instrument": instrument,
+        "strategy": strategy,
+        "side": side,
+        "order_type": order_type,
+        "entry_price": float(entry),
+        "stop_loss": float(sl),
+        "take_profit": float(tp),
+        "time_stop_bars": int(time_stop_bars),
+        "confidence": float(np.clip(confidence, 0.0, 1.0)),
+        "pwin": float(np.clip(pwin, 0.0, 1.0)),
+        "ev_r": float(ev_r),
+        "rr": float(rr),
+        "validity_sec": int(validity_sec),
+        "ts": time.time(),
+        "meta": metadata or {},
+    }
+
+
+def build_market_snapshot(instr):
+    refresh_pricing_once()
+    m5 = get_candles(instr, count=500, granularity="M5")
+    m15 = get_candles(instr, count=300, granularity="M15")
+    h1 = get_candles(instr, count=300, granularity="H1")
+    if m5 is None or m15 is None or h1 is None or len(m5) < 120:
+        return None
+    mid = float(price_cache.get(instr, m5["c"].iloc[-1]))
+    atr_val = float(atr(m5, ATR_PERIOD).iloc[-1] or 0.0)
+    atr_pct = float(atr_val / (mid + 1e-9))
+    ema20 = float(ema(m5["c"], 20).iloc[-1])
+    ema50 = float(ema(m5["c"], 50).iloc[-1])
+    z = float(zscore(m5["c"], lookback=min(200, len(m5))).iloc[-1]) if len(m5) > 50 else 0.0
+    comp_s, _ = compression_score(m5["c"], n=BBANDS_N, q=SQUEEZE_Q)
+    brk_dir, brk_lvl, brk_mag = breakout_signal(m5, n=DONCHIAN_N)
+    lux = lux_draw_on_liquidity(
+        m5,
+        length=LIQ_SW_LENGTH,
+        area_mode="full" if LIQ_SW_AREA.lower().startswith("full") else "wick",
+        filter_by="volume" if LIQ_SW_FILTER.lower().startswith("vol") else "count",
+        threshold=LIQ_SW_THRESHOLD,
+    )
+    reg_intraday, risk_mult = compute_intraday_regime(m5)
+    mode = classify_regime_mode(reg_intraday, reg_intraday, atr_val, mid)
+    spr_block, spr_info = spread_liquidity_guard(instr)
+    liq = liquidity_factor(instr)
+    return {
+        "instrument": instr,
+        "mid": mid,
+        "spread": float(spread_cache.get(instr, 0.0) or 0.0),
+        "dfs": {"M5": m5, "M15": m15, "H1": h1},
+        "atr": atr_val,
+        "atr_pct": atr_pct,
+        "ema20": ema20,
+        "ema50": ema50,
+        "zscore": z,
+        "compression": float(comp_s),
+        "breakout": {"dir": int(brk_dir), "level": float(brk_lvl), "mag": float(brk_mag)},
+        "lux": lux,
+        "regime": reg_intraday,
+        "mode": mode,
+        "risk_mult": float(risk_mult),
+        "spread_block": bool(spr_block),
+        "spread_info": spr_info,
+        "liq_factor": float(liq),
+        "event_block": bool(event_guardrails(instr) or event_guardrails_strict(instr)),
+        "mtf_votes": mtf_direction_vote(instr)[0],
+        "created_ts": time.time(),
+    }
+
+
+def strategy_trend_pullback(snapshot):
+    m5, m15, h1 = snapshot["dfs"]["M5"], snapshot["dfs"]["M15"], snapshot["dfs"]["H1"]
+    e15f, e15s = ema(m15["c"], 10).iloc[-1], ema(m15["c"], 30).iloc[-1]
+    eh1f, eh1s = ema(h1["c"], 10).iloc[-1], ema(h1["c"], 30).iloc[-1]
+    trend_dir = 1 if (e15f > e15s and eh1f > eh1s) else -1 if (e15f < e15s and eh1f < eh1s) else 0
+    if trend_dir == 0 or snapshot["event_block"] or snapshot["spread_block"]:
+        return None
+    pullback_zone = ema(m5["c"], 20).iloc[-1] if trend_dir > 0 else ema(m5["c"], 20).iloc[-1]
+    near_pullback = abs(snapshot["mid"] - pullback_zone) <= 0.8 * snapshot["atr"]
+    if not near_pullback:
+        return None
+    entry = float(pullback_zone)
+    sl = entry - 1.6 * snapshot["atr"] if trend_dir > 0 else entry + 1.6 * snapshot["atr"]
+    tp = entry + 2.0 * abs(entry - sl) if trend_dir > 0 else entry - 2.0 * abs(entry - sl)
+    confidence = min(1.0, 0.55 + 0.25 * snapshot["liq_factor"])
+    pwin = min(0.85, 0.50 + 0.20 * confidence)
+    evr = pwin * 2.0 - (1 - pwin)
+    return make_trade_plan(snapshot["instrument"], "Trend-Pullback", "BUY" if trend_dir > 0 else "SELL", "LIMIT" if near_pullback else "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"trend_dir": trend_dir})
+
+
+def strategy_squeeze_breakout(snapshot):
+    brk = snapshot["breakout"]
+    if snapshot["event_block"] or snapshot["spread_block"]:
+        return None
+    if snapshot["compression"] < 0.70 or abs(brk["dir"]) == 0 or brk["mag"] < 0.2:
+        return None
+    h1 = snapshot["mtf_votes"].get("H1", 0)
+    if h1 == -brk["dir"]:
+        return None
+    entry = brk["level"]
+    sl = entry - 1.8 * snapshot["atr"] if brk["dir"] > 0 else entry + 1.8 * snapshot["atr"]
+    tp = entry + 2.5 * abs(entry - sl) if brk["dir"] > 0 else entry - 2.5 * abs(entry - sl)
+    confidence = min(1.0, 0.45 + 0.35 * snapshot["compression"] + 0.2 * min(1.0, brk["mag"]))
+    pwin = min(0.75, 0.45 + 0.15 * confidence)
+    evr = pwin * 2.5 - (1 - pwin)
+    return make_trade_plan(snapshot["instrument"], "Squeeze-Breakout", "BUY" if brk["dir"] > 0 else "SELL", "STOP", entry, sl, tp, max(6, TIME_STOP_BARS // 2), confidence, pwin, evr, COOLDOWN_SEC * 2, {"compression": snapshot["compression"], "brk_mag": brk["mag"]})
+
+
+def strategy_range_mean_reversion(snapshot):
+    if snapshot["mode"] not in ("range", "low_vol"):
+        return None
+    if snapshot["event_block"] or snapshot["spread_block"]:
+        return None
+    z = snapshot["zscore"]
+    if abs(z) < 1.3:
+        return None
+    side = -1 if z > 0 else 1
+    entry = snapshot["mid"]
+    sl = entry - 1.4 * snapshot["atr"] if side > 0 else entry + 1.4 * snapshot["atr"]
+    tp = snapshot["ema20"]
+    confidence = min(1.0, 0.50 + 0.15 * min(2.5, abs(z)) / 2.5 + 0.2 * snapshot["liq_factor"])
+    pwin = min(0.82, 0.52 + 0.18 * confidence)
+    rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
+    evr = pwin * rr - (1 - pwin)
+    return make_trade_plan(snapshot["instrument"], "Range-MeanReversion", "BUY" if side > 0 else "SELL", "LIMIT", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"zscore": z})
+
+
+def strategy_liquidity_sweep(snapshot):
+    if snapshot["mode"] not in ("range", "neutral"):
+        return None
+    draw = float(snapshot["lux"].get("lux_draw", 0.0) or 0.0)
+    if abs(draw) < 0.35 or snapshot["event_block"]:
+        return None
+    side = 1 if draw < 0 else -1
+    entry = snapshot["mid"]
+    sl = entry - 1.5 * snapshot["atr"] if side > 0 else entry + 1.5 * snapshot["atr"]
+    tp = entry + 1.8 * abs(entry - sl) if side > 0 else entry - 1.8 * abs(entry - sl)
+    confidence = min(1.0, 0.45 + 0.4 * abs(draw))
+    pwin = min(0.78, 0.48 + 0.2 * confidence)
+    evr = pwin * 1.8 - (1 - pwin)
+    return make_trade_plan(snapshot["instrument"], "Liquidity-Sweep-Reversal", "BUY" if side > 0 else "SELL", "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"lux_draw": draw})
+
+
+def candidate_plans_from_snapshot(snapshot):
+    cands = []
+    for fn in [strategy_trend_pullback, strategy_squeeze_breakout, strategy_range_mean_reversion, strategy_liquidity_sweep]:
+        try:
+            p = fn(snapshot)
+            if p:
+                cands.append(p)
+        except Exception as e:
+            log_event("INFO", snapshot["instrument"], f"strategy {fn.__name__} failed", {"err": str(e)}, level=1)
+    return cands
+
+
+def plan_passes_gates(plan, snapshot):
+    if plan["rr"] < MIN_PLAN_RR:
+        return False, "RR"
+    if plan["ev_r"] < MIN_PLAN_EVR:
+        return False, "EV"
+    if snapshot["event_block"]:
+        return False, "Event"
+    spr_pct_block, _ = spread_percentile_guard(plan["instrument"])
+    if spr_pct_block or snapshot["spread_block"]:
+        return False, "Spread"
+    return True, "OK"
+
+
+def strategy_router(instr, snapshot):
+    plans = candidate_plans_from_snapshot(snapshot)
+    debug = []
+    survivors = []
+    for p in plans:
+        ok, reason = plan_passes_gates(p, snapshot)
+        debug.append({"strategy": p["strategy"], "ev_r": p["ev_r"], "rr": p["rr"], "confidence": p["confidence"], "gate": reason})
+        if ok and strategy_enabled(p["strategy"]):
+            mismatch_penalty = 0.9 if (snapshot["mode"] == "trend" and "Range" in p["strategy"]) else 1.0
+            p["rank"] = p["ev_r"] * p["confidence"] * snapshot["liq_factor"] * mismatch_penalty
+            survivors.append(p)
+    chosen = max(survivors, key=lambda x: x["rank"]) if survivors else None
+    log_event("DECISION", instr, "Plan candidates", {"regime": snapshot["regime"], "plans": debug, "chosen": (chosen or {}).get("strategy")}, level=2)
+    return chosen, debug
+
+
+def plan_id(plan):
+    bucket = int(time.time() // (SIGNAL_ID_TTL_MIN * 60))
+    raw = f"{plan['instrument']}|{plan['strategy']}|{plan['side']}|{round(plan['entry_price'],5)}|{bucket}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:18]
+
+
+def plan_seen_recently(pid):
+    now = time.time()
+    exp = [k for k, ts in recent_plan_ids.items() if now - ts > SIGNAL_ID_TTL_MIN * 60]
+    for k in exp:
+        recent_plan_ids.pop(k, None)
+    if pid in recent_plan_ids:
+        return True
+    recent_plan_ids[pid] = now
+    return False
+
+
+def place_limit_entry_order(instr, units, price, tp=None, sl=None):
+    order = {
+        "order": {
+            "units": str(units),
+            "instrument": instr,
+            "price": f"{_round_price(instr, price)}",
+            "timeInForce": "GTC",
+            "type": "LIMIT",
+            "positionFill": "DEFAULT"
+        }
+    }
+    if tp is not None:
+        order["order"]["takeProfitOnFill"] = {"price": f"{tp}"}
+    if sl is not None:
+        order["order"]["stopLossOnFill"] = {"price": f"{sl}"}
+    return safe_post(f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders", json_data=order)
+
+
+def risk_approve_and_size(plan, snapshot):
+    nav, _ = get_nav()
+    heat = current_portfolio_heat(nav)
+    if heat >= PORTFOLIO_HEAT_LIMIT:
+        return None, {"blocked": "heat", "heat": heat}
+    cluster = currency_cluster_exposure_pct(nav, 1 if plan["side"] == "BUY" else -1, plan["instrument"])
+    if cluster >= CLUSTER_HEAT_LIMIT:
+        return None, {"blocked": "cluster", "cluster": cluster}
+    direction = 1 if plan["side"] == "BUY" else -1
+    units = units_from_risk(plan["instrument"], snapshot["mid"], snapshot["atr"], direction)
+    conf_mult = 0.6 + 0.8 * plan["confidence"]
+    regime_mult = 0.6 if snapshot["mode"] == "high_vol" else 1.0
+    corr_pen = max(0.4, 1.0 - min(0.6, cluster * 10.0))
+    units = int(units * conf_mult * regime_mult * corr_pen * snapshot.get("risk_mult", 1.0))
+    units = realized_vol_target(units, snapshot["dfs"]["M5"])
+    if units == 0:
+        return None, {"blocked": "units_zero"}
+    plan2 = dict(plan)
+    plan2["units"] = units
+    plan2["risk_diag"] = {"heat": heat, "cluster": cluster, "conf_mult": conf_mult, "regime_mult": regime_mult, "corr_pen": corr_pen}
+    return plan2, plan2["risk_diag"]
+
+
+def execute_trade_plan(plan, snapshot):
+    pid = plan_id(plan)
+    if plan_seen_recently(pid):
+        return None, {"skip": "duplicate_plan", "plan_id": pid}
+    direction = 1 if plan["side"] == "BUY" else -1
+    units = abs(int(plan["units"])) * direction
+    entry = float(plan["entry_price"])
+    sl = _round_price(plan["instrument"], plan["stop_loss"])
+    tp = _round_price(plan["instrument"], plan["take_profit"])
+    true_entry = entry if plan["order_type"] in ("STOP", "LIMIT") else snapshot["mid"]
+    rr = abs(tp - true_entry) / max(abs(true_entry - sl), 1e-9)
+    if rr < MIN_PLAN_RR:
+        return None, {"skip": "rr_invalid", "rr": rr}
+
+    pctl_block, pctl_info = spread_percentile_guard(plan["instrument"])
+    if pctl_block and plan["order_type"] == "MARKET":
+        return None, {"skip": "spread_high_no_market", **pctl_info}
+
+    resp = None
+    if plan["order_type"] == "STOP":
+        resp = place_stop_entry_order(plan["instrument"], units, price=entry, tp=tp, sl=sl)
+    elif plan["order_type"] == "LIMIT":
+        resp = place_limit_entry_order(plan["instrument"], units, price=entry, tp=tp, sl=sl)
+    else:
+        resp = place_market_order(plan["instrument"], units, tp=tp, sl=sl)
+
+    latest_plan_cache[plan["instrument"]] = {**plan, "plan_id": pid, "exec_ts": utc_now_iso(), "rr_exec": rr}
+    return resp, {"plan_id": pid, "rr": rr}
+
+
+def lifecycle_manager(sl_buffer=0.04):
+    for instr in INSTRUMENTS:
+        manage_active_trades(instr, sl_buffer=sl_buffer)
+
+
+def update_strategy_performance_from_fills():
+    global last_tx_seen
+    tx = safe_get(f"{HOST}/accounts/{OANDA_ACCOUNTID}/transactions") or {}
+    rows = [t for t in tx.get("transactions", []) if t.get("type") == "ORDER_FILL"]
+    if not rows:
+        return
+    rows = sorted(rows, key=lambda x: int(x.get("id", 0)))
+    for t in rows:
+        tid = str(t.get("id"))
+        if last_tx_seen is not None and int(tid) <= int(last_tx_seen):
+            continue
+        pl = float(t.get("pl", 0.0) or 0.0)
+        trade_closed = t.get("tradeReduced") or t.get("tradesClosed")
+        if not trade_closed:
+            continue
+        instr = t.get("instrument", "")
+        plan = latest_plan_cache.get(instr, {})
+        strat = plan.get("strategy", "Unknown")
+        risk = abs(float(plan.get("entry_price", 0.0)) - float(plan.get("stop_loss", 0.0)))
+        units = abs(float(plan.get("units", 0.0) or 0.0))
+        r = pl / max(risk * max(units, 1.0), 1e-9)
+        s = strategy_stats[strat]
+        s["n"] += 1
+        if pl > 0:
+            s["wins"] += 1
+        s["sum_r"] += r
+        s["last50"].append(r)
+        strategy_perf[strat].append(r)
+
+        if len(s["last50"]) >= RISK_CUTOFF_EXPECTANCY_TRADES and float(np.mean(s["last50"])) < 0:
+            strategy_disable_until[strat] = time.time() + STRAT_DISABLE_COOLDOWN_MIN * 60
+            log_event("RISK", instr, f"Disabled strategy {strat} for cooldown", {"mean_r": float(np.mean(s['last50']))}, level=1)
+        last_tx_seen = tid
 
 def edge_report(instr, score, regime, ev_guard, spr_info, beta_alpha, var_est, risk_mult, atrp):
     macro = fetch_macro_context() or {}
@@ -2581,157 +2927,49 @@ async def fibplan_cmd(ctx, instrument: str):
 
 async def trade_once(instr):
     try:
-        refresh_pricing_once()
-        df = get_candles(instr, count=500)
-        if df is None or len(df) < 120:
+        snapshot = build_market_snapshot(instr)
+        if not snapshot:
             return
 
-        price = float(price_cache.get(instr, df["c"].iloc[-1]))
-        price_cache[instr] = price
-        atr_val = float(atr(df, ATR_PERIOD).iloc[-1] or 0.0)
         nav, _ = get_nav()
-
         kill, kill_diag = daily_kill_switch_triggered(nav)
         if kill:
             log_event("RISK", instr, "Daily kill switch active", kill_diag, level=1)
             return
 
-        sigs, diag = build_signals(df, instr)
-        comp_s, _bw = compression_score(df["c"], n=BBANDS_N, q=SQUEEZE_Q)
-        dirn, _lvl, brk_mag = breakout_signal(df, n=DONCHIAN_N)
-        lux = lux_draw_on_liquidity(
-            df,
-            length=LIQ_SW_LENGTH,
-            area_mode="full" if LIQ_SW_AREA.lower().startswith("full") else "wick",
-            filter_by="volume" if LIQ_SW_FILTER.lower().startswith("vol") else "count",
-            threshold=LIQ_SW_THRESHOLD,
-        )
-        sigs["compression"] = float(comp_s)
-        sigs["breakout"] = float(dirn * max(0.0, brk_mag))
-        sigs["lux_draw"] = round(float(lux["lux_draw"]), 3)
-        sigs["lux_above_score"] = round(float(lux["lux_above_score"]), 3)
-        sigs["lux_below_score"] = round(float(lux["lux_below_score"]), 3)
+        # one plan max per instrument per cycle by design
+        plan, candidates = strategy_router(instr, snapshot)
+        latest_plan_cache[instr] = {"snapshot_regime": snapshot["regime"], "candidates": candidates, "selected": plan}
 
-        score, regime_k, weights, pwin = ensemble_score(instr, df, sigs, diag)
-        score = score + 0.25 * sigs["breakout"] * (0.5 + 0.5 * max(0.0, sigs["compression"]))
-
-        reg_intraday, risk_mult = compute_intraday_regime(df)
-        mode = classify_regime_mode(regime_k, reg_intraday, atr_val, price)
-        strat = select_best_strategy(instr, df, sigs, score, mode)
-        if not strat or not strategy_enabled(strat["name"]):
-            log_event("DECISION", instr, "Skip: strategy disabled/no candidate", level=1)
+        if not plan:
+            log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"]}, level=1)
+            set_cache(instr, {"score": 0.0, "regime": snapshot["regime"], "strategy": "NONE", "plan": None}, snapshot["mid"])
             return
 
-        mtf_votes, mtf_dir = mtf_direction_vote(instr)
-        direction = int(strat["direction"] if strat["direction"] != 0 else (1 if score >= 0 else -1))
-
-        strong_h1_against = mtf_votes.get("H1", 0) == -direction
-        aligned_count = sum(1 for v in mtf_votes.values() if v == direction)
-        breakout_exception = strat["name"] == "Breakout-Squeeze" and abs(sigs.get("breakout", 0.0)) > 0.35 and not strong_h1_against
-        if aligned_count < 2 and not breakout_exception:
-            log_event("GUARD", instr, "Blocked by MTF vote", {"votes": mtf_votes, "dir": direction}, level=1)
+        approved_plan, risk_diag = risk_approve_and_size(plan, snapshot)
+        if not approved_plan:
+            log_event("RISK", instr, "Plan blocked by portfolio risk", risk_diag, level=1)
             return
 
+        # store signal cache for discord visibility
         set_cache(
             instr,
             {
-                "score": round(score, 3),
-                "regime": regime_k,
-                "pwin": round(pwin, 3),
-                "strategy": strat["name"],
-                "mode": mode,
-                **{k: round(float(sigs.get(k, 0)), 3) for k in sigs.keys()},
+                "score": round(float(approved_plan.get("ev_r", 0.0)), 3),
+                "regime": snapshot["regime"],
+                "strategy": approved_plan["strategy"],
+                "pwin": round(float(approved_plan.get("pwin", 0.0)), 3),
+                "rr": round(float(approved_plan.get("rr", 0.0)), 3),
+                "entry_type": approved_plan["order_type"],
+                "plan": approved_plan,
             },
-            price,
+            snapshot["mid"],
         )
 
-        ret1 = float(np.log(df["c"].iloc[-1] / df["c"].iloc[-2]))
-        y = 1.0 if ret1 > 0 else 0.0
-        x = ml_features(df, sigs, diag)
-        ml_update(instr, x, y)
-
-        if count_open_positions(instr) >= MAX_POSITIONS_PER_INSTR:
+        resp, exec_diag = execute_trade_plan(approved_plan, snapshot)
+        if resp is None:
+            log_event("ORDER", instr, "Execution skipped", exec_diag, level=1)
             return
-        if abs(score) < 0.25:
-            return
-        if strategy_sharpe() < SHARPE_FLOOR:
-            return
-        if event_guardrails(instr) or event_guardrails_strict(instr):
-            log_event("GUARD", instr, "Blocked by event window", level=1)
-            return
-
-        spr_block, spr_info = spread_liquidity_guard(instr)
-        spr_pctl_block, spr_pctl_info = spread_percentile_guard(instr)
-        atr_spike, atr_diag = atr_spike_guard(df)
-        if spr_block or spr_pctl_block:
-            log_event("GUARD", instr, "Blocked by spread guard", {**spr_info, **spr_pctl_info}, level=1)
-            return
-        if atr_spike and strat["name"] != "Breakout-Squeeze":
-            log_event("GUARD", instr, "Blocked by ATR spike", atr_diag, level=1)
-            return
-
-        evc = edge_vs_cost(score, atr_val, price, instr)
-        min_edge = MIN_EDGE_MULT_COST * (1.2 if mode == "high_vol" else 1.0)
-        if evc < min_edge:
-            return
-
-        var_est = portfolio_var(price_cache, horizon_days=1, cl=0.99)
-        if var_est["param"] > VAR_LIMIT_PCT:
-            return
-
-        if idea_dedup_block(instr, direction):
-            log_event("DECISION", instr, "Skip: signal de-dup", {"dir": direction}, level=1)
-            return
-
-        heat = current_portfolio_heat(nav)
-        if heat >= PORTFOLIO_HEAT_LIMIT:
-            log_event("RISK", instr, "Portfolio heat limit", {"heat": heat}, level=1)
-            return
-        cluster_exp = currency_cluster_exposure_pct(nav, direction, instr)
-        if cluster_exp >= CLUSTER_HEAT_LIMIT:
-            log_event("RISK", instr, "Correlation/cluster cap", {"cluster_exp": cluster_exp}, level=1)
-            return
-
-        units = units_from_risk(instr, price, atr_val, direction)
-        regime_mult = 0.6 if mode == "high_vol" else 1.0
-        units = int(units * risk_mult * regime_mult)
-        units = realized_vol_target(units, df)
-        if units == 0:
-            return
-
-        tp, sl = tp_sl_levels(instr, price, atr_val, direction, score, sigs.get("fat_tails", 0.0))
-        order_plan = choose_order_for_breakout(instr, df, score)
-
-        entry_type = strat["entry_type"]
-        entry_level = price
-        if entry_type == "STOP" and order_plan.get("use_stop"):
-            entry_level = float(order_plan["stop_price"])
-        elif entry_type == "LIMIT":
-            ema_ref = float(ema(df["c"], EMA_PERIOD).iloc[-1])
-            entry_level = _round_price(instr, ema_ref)
-
-        sid = signal_id(instr, direction, strat["name"], entry_level)
-        if signal_id_seen(sid):
-            log_event("DECISION", instr, "Skip: idempotent signal", {"sid": sid}, level=1)
-            return
-
-        entry_for_rr = float(order_plan["stop_price"] if (entry_type == "STOP" and order_plan.get("use_stop")) else price)
-        rr = abs(tp - entry_for_rr) / max(abs(entry_for_rr - sl), 1e-9)
-        if rr < 1.0:
-            log_event("DECISION", instr, f"Skip: RR={rr:.2f}<1.0", level=1)
-            return
-
-        resp = None
-        if entry_type == "STOP" and order_plan.get("use_stop"):
-            aligned = (order_plan["dir"] > 0 and units > 0) or (order_plan["dir"] < 0 and units < 0)
-            if aligned:
-                resp = place_stop_entry_order(instr, units, price=order_plan["stop_price"], tp=tp, sl=sl)
-            else:
-                resp = place_market_order(instr, units, tp=tp, sl=sl)
-        elif entry_type == "LIMIT":
-            resp = place_market_order(instr, units, tp=tp, sl=sl)
-        else:
-            resp = place_market_order(instr, units, tp=tp, sl=sl)
 
         trade_id = None
         if isinstance(resp, dict):
@@ -2741,27 +2979,26 @@ async def trade_once(instr):
         if trade_id:
             trade_entry_meta[trade_id] = {
                 "ts": time.time(),
-                "strategy": strat["name"],
-                "score": score,
-                "entry_type": entry_type,
+                "strategy": approved_plan["strategy"],
+                "score": approved_plan["ev_r"],
+                "entry_type": approved_plan["order_type"],
                 "be_moved": False,
                 "partial_taken": False,
+                "time_stop_bars": approved_plan.get("time_stop_bars", TIME_STOP_BARS),
             }
 
-        log_feature_attribution(instr, strat["name"], mode, entry_type, score, sigs, spr_pctl_info, atr_diag)
+        log_feature_attribution(
+            instr,
+            approved_plan["strategy"],
+            snapshot["mode"],
+            approved_plan["order_type"],
+            approved_plan["ev_r"],
+            {"breakout": snapshot["breakout"]["mag"], "meanrev": -abs(snapshot["zscore"]), "lux_draw": snapshot["lux"].get("lux_draw", 0.0)},
+            snapshot.get("spread_info", {}),
+            {"multiple": snapshot["atr_pct"] / max(1e-9, 0.001)},
+        )
 
-        atrp = atr_val / (price + 1e-9)
-        beta_alpha = compute_beta_alpha(instr)
-        rep = edge_report(instr, score, reg_intraday, False, spr_info, beta_alpha, var_est, risk_mult, atrp)
-        logger.info(f"[EDGE] {json.dumps(rep)[:400]}")
-        logger.info(f"[ORDER] {instr} strategy={strat['name']} type={entry_type} units={units} resp={(json.dumps(resp) if resp else 'None')[:240]}")
-
-        last_ret = (df["c"].iloc[-1] - df["c"].iloc[-2]) / (df["c"].iloc[-2] + 1e-9)
-        signed_ret = np.sign(direction) * last_ret
-        trade_pnl_history.append(signed_ret)
-        strategy_perf[strat["name"]].append(signed_ret)
-        reward = np.sign(score) * last_ret
-        exp3_update(instr, {k: max(-0.01, min(0.01, reward)) for k in weights.keys()})
+        log_event("ORDER", instr, "Executed plan", {"strategy": approved_plan["strategy"], "type": approved_plan["order_type"], "units": approved_plan["units"], **exec_diag}, level=1)
 
     except Exception as e:
         logger.exception(f"trade_once error {instr}: {e}")
@@ -2791,12 +3028,12 @@ async def auto_trader():
             except Exception:
                 logger.exception("auto_trader gather error")
 
-            # 2) Post-trade management (move SL to BE+buffer when halfway, etc.)
+            # 2) Trade lifecycle manager + strategy performance updates
             try:
-                for instr in INSTRUMENTS:
-                    manage_active_trades(instr, sl_buffer=0.04)  # 3–5% of R; 0.04 is 4%
+                lifecycle_manager(sl_buffer=0.04)
+                update_strategy_performance_from_fills()
             except Exception:
-                logger.exception("manage_active_trades error")
+                logger.exception("lifecycle/performance manager error")
 
             # 3) Hard daily closeout at 17:00 New York (once per day)
             try:
@@ -2830,9 +3067,16 @@ async def on_ready():
 async def status(ctx):
     acct = get_account_summary()
     total_pl, win_rate, total_unrealized = compute_pl_winrate()
+    active = []
+    for ins in INSTRUMENTS:
+        lp = latest_plan_cache.get(ins, {})
+        sel = lp.get("selected") if isinstance(lp, dict) else None
+        if sel:
+            active.append(f"{ins}:{sel.get('strategy')} {sel.get('side')} rr={sel.get('rr',0):.2f} evr={sel.get('ev_r',0):.2f}")
+    active_txt = " | ".join(active[:3]) if active else "no active selected plans"
     await ctx.send(
         f"Balance: {acct.get('NAV')} {acct.get('currency')} | "
-        f"Total P/L: {total_pl:.2f} | Win Rate: {win_rate:.1f}% | Unrlzd: {total_unrealized:.2f} | Sharpe≈{strategy_sharpe():.2f}"
+        f"Total P/L: {total_pl:.2f} | Win Rate: {win_rate:.1f}% | Unrlzd: {total_unrealized:.2f} | Sharpe≈{strategy_sharpe():.2f} | Plans: {active_txt}"
     )
 
 @bot.command(name="auto")
@@ -2855,7 +3099,16 @@ async def signal_cmd(ctx, instrument: str):
         await ctx.send(f"Unknown instrument. Choose from {', '.join(INSTRUMENTS)}")
         return
     sig, px = signal_cache.get(instrument), price_cache.get(instrument)
-    await ctx.send(f"{instrument} mid={px} signal={sig}")
+    lp = latest_plan_cache.get(instrument, {})
+    sel = lp.get("selected") if isinstance(lp, dict) else None
+    if sel:
+        await ctx.send(
+            f"{instrument} mid={px} regime={lp.get('snapshot_regime')} strategy={sel.get('strategy')} "
+            f"side={sel.get('side')} type={sel.get('order_type')} entry={sel.get('entry_price'):.5f} "
+            f"sl={sel.get('stop_loss'):.5f} tp={sel.get('take_profit'):.5f} rr={sel.get('rr'):.2f} evr={sel.get('ev_r'):.2f}"
+        )
+    else:
+        await ctx.send(f"{instrument} mid={px} signal={sig}")
 
 @bot.command(name="positions")
 async def positions(ctx):
