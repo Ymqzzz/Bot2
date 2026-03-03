@@ -1,5 +1,5 @@
 # ========== IMPORTS ==========
-import os, time, requests, asyncio, logging, math, json, statistics
+import os, time, requests, asyncio, logging, math, json, statistics, hashlib
 import pandas as pd
 import numpy as np
 import discord
@@ -72,6 +72,20 @@ ECON_TTL  = int(os.environ.get("ECON_TTL",  "300"))
 COT_TTL   = int(os.environ.get("COT_TTL",   "21600"))
 CORR_WIN  = int(os.environ.get("CORR_WIN",  "45"))   # bars
 EVENT_WINDOW_MIN = int(os.environ.get("EVENT_WINDOW_MIN", "10"))
+EVENT_PRE_BUFFER_MIN = int(os.environ.get("EVENT_PRE_BUFFER_MIN", "20"))
+EVENT_POST_BUFFER_MIN = int(os.environ.get("EVENT_POST_BUFFER_MIN", "20"))
+
+# Trading upgrade pack controls
+SPREAD_GUARD_PCTL = float(os.environ.get("SPREAD_GUARD_PCTL", "95"))
+ATR_SPIKE_MULT = float(os.environ.get("ATR_SPIKE_MULT", "1.8"))
+IDEA_DEDUP_BARS = int(os.environ.get("IDEA_DEDUP_BARS", "6"))
+SIGNAL_ID_TTL_MIN = int(os.environ.get("SIGNAL_ID_TTL_MIN", "45"))
+PORTFOLIO_HEAT_LIMIT = float(os.environ.get("PORTFOLIO_HEAT_LIMIT", "0.015"))
+CLUSTER_HEAT_LIMIT = float(os.environ.get("CLUSTER_HEAT_LIMIT", "0.009"))
+DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.02"))
+DAILY_DD_KILL_PCT = float(os.environ.get("DAILY_DD_KILL_PCT", "0.015"))
+TIME_STOP_BARS = int(os.environ.get("TIME_STOP_BARS", "18"))
+RISK_CUTOFF_EXPECTANCY_TRADES = int(os.environ.get("RISK_CUTOFF_EXPECTANCY_TRADES", "30"))
 
 # Optional external keys
 TRADING_ECON_KEY = os.environ.get("TRADING_ECON_KEY", "")
@@ -185,6 +199,12 @@ weights_prob     = {}
 exp3_gamma       = 0.07
 trade_pnl_history = deque(maxlen=2000)
 portfolio_positions = {}
+signal_dedup_state = {}
+executed_signal_ids = {}
+strategy_perf = defaultdict(lambda: deque(maxlen=200))
+trade_entry_meta = {}
+feature_attribution_log = deque(maxlen=5000)
+daily_risk_state = {"day": None, "start_nav": None, "peak_nav": None, "kill": False}
 # Analysis / Ops log
 from threading import Lock
 analysis_log = deque(maxlen=LOG_MAX)
@@ -574,35 +594,53 @@ def record_pnl_snapshot(path="pnl_history.csv"):
         pass
 
 def manage_active_trades(instr, sl_buffer=0.04):
-    """
-    Moves SL to slightly above BE (3–5%) once price reaches halfway to TP.
-    """
+    """Advanced management: 1R BE move, 1.5R partial, time-stop and opposite-signal exit."""
     trades = get_open_trades(instr)
     if not trades:
         return
 
+    latest_sig = signal_cache.get(instr, {}) if isinstance(signal_cache.get(instr), dict) else {}
+    flip_score = float(latest_sig.get("score", 0.0) or 0.0)
+
     for t in trades:
-        ep = float(t.get("price", 0))
-        sl = float(t.get("stopLossOrder", {}).get("price", ep))
-        tp = float(t.get("takeProfitOrder", {}).get("price", ep))
-        side = int(t.get("currentUnits", 0))
-        mid = get_midprice(instr)
-        if side == 0:
+        tid = t.get("id")
+        ep = float(t.get("price", 0.0) or 0.0)
+        sl = float((t.get("stopLossOrder") or {}).get("price", ep))
+        side = int(float(t.get("currentUnits", 0) or 0))
+        units_abs = abs(side)
+        mid = float(get_midprice(instr) or ep)
+        if side == 0 or units_abs == 0:
             continue
 
-        half_target = ep + (tp - ep) / 2
-        reached_half = (side > 0 and mid >= half_target) or (side < 0 and mid <= half_target)
-        if not reached_half:
+        risk_per_unit = max(abs(ep - sl), 1e-9)
+        r_mult = ((mid - ep) / risk_per_unit) if side > 0 else ((ep - mid) / risk_per_unit)
+
+        meta = trade_entry_meta.setdefault(tid, {"ts": time.time(), "be_moved": False, "partial_taken": False})
+        bars_open = (time.time() - meta["ts"]) / max(COOLDOWN_SEC, 1)
+
+        if (not meta["be_moved"]) and r_mult >= 1.0 and t.get("stopLossOrder", {}).get("id"):
+            new_sl = ep + sl_buffer * risk_per_unit if side > 0 else ep - sl_buffer * risk_per_unit
+            safe_put(
+                f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders/{t['stopLossOrder']['id']}",
+                json_data={"order": {"price": f"{_round_price(instr, new_sl)}"}},
+            )
+            meta["be_moved"] = True
+            log_event("MANAGE", instr, f"{tid}: SL -> BE+buffer at +1R", {"new_sl": new_sl}, level=1)
+
+        if (not meta["partial_taken"]) and r_mult >= 1.5:
+            cut_units = -int(math.copysign(max(1, int(units_abs * 0.4)), side))
+            place_market_order(instr, cut_units)
+            meta["partial_taken"] = True
+            log_event("MANAGE", instr, f"{tid}: partial take at +1.5R", {"cut_units": cut_units}, level=1)
+
+        if bars_open >= TIME_STOP_BARS and r_mult < 0.5:
+            place_market_order(instr, -side)
+            log_event("MANAGE", instr, f"{tid}: time-stop exit", {"bars_open": bars_open, "r": r_mult}, level=1)
             continue
 
-        adj = sl_buffer * abs(tp - ep)
-        new_sl = ep + adj if side > 0 else ep - adj
-
-        if (side > 0 and new_sl > sl) or (side < 0 and new_sl < sl):
-            safe_put(f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders/{t['stopLossOrder']['id']}",
-                     json_data={"order": {"price": f"{_round_price(instr, new_sl)}"}})
-            log_event("MANAGE", instr, f"Moved SL → {new_sl} (+{sl_buffer*100:.0f}% buffer)", level=1)
-
+        if (side > 0 and flip_score <= -0.5) or (side < 0 and flip_score >= 0.5):
+            place_market_order(instr, -side)
+            log_event("MANAGE", instr, f"{tid}: opposite-signal exit", {"score": flip_score}, level=1)
 
 def safe_put(url, json_data=None, retries=3):
     for _ in range(retries):
@@ -1319,6 +1357,210 @@ def higher_tf_alignment(instr):
     if t1 == t2 == t3 == -1:
         return -1.0
     return 0.0
+
+
+def mtf_direction_vote(instr):
+    """Return directional vote using M5/M15/H1 trend signs."""
+    votes = {}
+    for tf in ["M5", "M15", "H1"]:
+        df = get_candles(instr, count=120, granularity=tf)
+        if df is None or len(df) < 40:
+            votes[tf] = 0
+            continue
+        ema_f = ema(df["c"], 10).iloc[-1]
+        ema_s = ema(df["c"], 30).iloc[-1]
+        votes[tf] = 1 if ema_f > ema_s else -1
+    total = int(sum(votes.values()))
+    return votes, (1 if total > 0 else -1 if total < 0 else 0)
+
+
+def classify_regime_mode(regime_k, reg_intraday, atr_val, price):
+    atrp = float(atr_val / (price + 1e-9))
+    if reg_intraday == "high_vol" or atrp > 0.006:
+        return "high_vol"
+    if regime_k in ("trend", "trending") or reg_intraday == "trending":
+        return "trend"
+    return "range"
+
+
+def strategy_candidates(instr, df, sigs, score):
+    direction = 1 if score >= 0 else -1
+    rev_dir = -1 if sigs.get("meanrev", 0.0) > 0 else 1
+    return [
+        {
+            "name": "Breakout-Squeeze",
+            "direction": direction,
+            "entry_type": "STOP",
+            "confidence": abs(0.7 * sigs.get("breakout", 0.0) + 0.3 * sigs.get("compression", 0.0)),
+            "validity_window": 3,
+        },
+        {
+            "name": "Range-MeanReversion",
+            "direction": rev_dir,
+            "entry_type": "LIMIT",
+            "confidence": abs(sigs.get("meanrev", 0.0)) * (1.0 + max(0.0, sigs.get("lux_draw", 0.0))),
+            "validity_window": 6,
+        },
+        {
+            "name": "Liquidity-Draw/Sweep",
+            "direction": 1 if sigs.get("lux_draw", 0.0) >= 0 else -1,
+            "entry_type": "MARKET",
+            "confidence": abs(sigs.get("lux_draw", 0.0)),
+            "validity_window": 4,
+        },
+    ]
+
+
+def select_best_strategy(instr, df, sigs, score, mode):
+    cands = strategy_candidates(instr, df, sigs, score)
+    mode_bias = {
+        "trend": {"Breakout-Squeeze": 1.2, "Range-MeanReversion": 0.8, "Liquidity-Draw/Sweep": 1.0},
+        "range": {"Breakout-Squeeze": 0.8, "Range-MeanReversion": 1.2, "Liquidity-Draw/Sweep": 1.05},
+        "high_vol": {"Breakout-Squeeze": 1.1, "Range-MeanReversion": 0.7, "Liquidity-Draw/Sweep": 1.0},
+    }
+    for c in cands:
+        perf = strategy_perf[c["name"]]
+        expectancy = np.mean(perf) if perf else 0.0
+        c["meta_score"] = c["confidence"] * mode_bias.get(mode, {}).get(c["name"], 1.0) + 0.05 * expectancy
+    return max(cands, key=lambda x: x["meta_score"]) if cands else None
+
+
+def spread_percentile_guard(instr):
+    spr = float(spread_cache.get(instr, 0.0) or 0.0)
+    hist = [v for ts, v in spread_history[instr] if time.time() - ts <= 3600]
+    if len(hist) < 25:
+        return False, {"spread": spr, "percentile": 50.0}
+    pctl = float((np.sum(np.array(hist) <= spr) / len(hist)) * 100.0)
+    return pctl >= SPREAD_GUARD_PCTL, {"spread": spr, "percentile": pctl}
+
+
+def atr_spike_guard(df):
+    atr_series = atr(df, ATR_PERIOD).dropna()
+    if len(atr_series) < 50:
+        return False, {"atr": 0.0, "atr_med": 0.0, "multiple": 0.0}
+    now = float(atr_series.iloc[-1])
+    med = float(atr_series.tail(50).median())
+    mult = now / (med + 1e-9)
+    return mult >= ATR_SPIKE_MULT, {"atr": now, "atr_med": med, "multiple": mult}
+
+
+def event_guardrails_strict(instr):
+    base, quote = pair_currencies(instr)
+    events = fetch_econ_calendar() or []
+    now = datetime.now(timezone.utc)
+    for e in events:
+        ccy = e.get("currency", "")
+        if ccy not in (base, quote):
+            continue
+        impact = str(e.get("impact", "")).lower()
+        if impact not in ("high", "medium", "3", "2"):
+            continue
+        when = e.get("when") or e.get("time")
+        try:
+            t = datetime.fromisoformat(str(when).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        mins = (t - now).total_seconds() / 60.0
+        if -EVENT_POST_BUFFER_MIN <= mins <= EVENT_PRE_BUFFER_MIN:
+            return True
+    return False
+
+
+def signal_id(instr, direction, setup_type, level):
+    bucket = int(time.time() // (SIGNAL_ID_TTL_MIN * 60))
+    raw = f"{instr}|{direction}|{setup_type}|{round(float(level),5)}|{bucket}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def signal_id_seen(sig_id):
+    now = time.time()
+    expired = [k for k, ts in executed_signal_ids.items() if now - ts > SIGNAL_ID_TTL_MIN * 60]
+    for k in expired:
+        executed_signal_ids.pop(k, None)
+    if sig_id in executed_signal_ids:
+        return True
+    executed_signal_ids[sig_id] = now
+    return False
+
+
+def idea_dedup_block(instr, direction):
+    ts, prev_dir = signal_dedup_state.get(instr, (0.0, 0))
+    bars_elapsed = (time.time() - ts) / max(COOLDOWN_SEC, 1)
+    if prev_dir == direction and bars_elapsed < IDEA_DEDUP_BARS:
+        return True
+    signal_dedup_state[instr] = (time.time(), direction)
+    return False
+
+
+def strategy_enabled(name):
+    perf = strategy_perf[name]
+    if len(perf) < RISK_CUTOFF_EXPECTANCY_TRADES:
+        return True
+    tail = list(perf)[-RISK_CUTOFF_EXPECTANCY_TRADES:]
+    return float(np.mean(tail)) >= 0.0
+
+
+def current_portfolio_heat(nav):
+    heat = 0.0
+    for ins in INSTRUMENTS:
+        for t in get_open_trades(ins):
+            ep = float(t.get("price", 0.0) or 0.0)
+            sl = float((t.get("stopLossOrder") or {}).get("price", ep))
+            u = abs(float(t.get("currentUnits", 0.0) or 0.0))
+            heat += abs(ep - sl) * u
+    return heat / (nav + 1e-9)
+
+
+def currency_cluster_exposure_pct(nav, direction, instr):
+    base, quote = pair_currencies(instr)
+    cluster = {base, quote}
+    exp = 0.0
+    for ins in INSTRUMENTS:
+        b, q = pair_currencies(ins)
+        if not ({b, q} & cluster):
+            continue
+        for t in get_open_trades(ins):
+            u = float(t.get("currentUnits", 0.0) or 0.0)
+            mid = float(price_cache.get(ins, 0.0) or 0.0)
+            exp += abs(u * mid)
+    return exp / (nav + 1e-9)
+
+
+def update_daily_risk_state(nav):
+    d = datetime.now(timezone.utc).date().isoformat()
+    if daily_risk_state["day"] != d:
+        daily_risk_state.update({"day": d, "start_nav": nav, "peak_nav": nav, "kill": False})
+    daily_risk_state["peak_nav"] = max(float(daily_risk_state.get("peak_nav") or nav), nav)
+
+
+def daily_kill_switch_triggered(nav):
+    update_daily_risk_state(nav)
+    start = float(daily_risk_state.get("start_nav") or nav)
+    peak = float(daily_risk_state.get("peak_nav") or nav)
+    if start <= 0:
+        return False, {}
+    realized_dd = (nav - start) / start
+    intraday_dd = (nav - peak) / peak if peak > 0 else 0.0
+    kill = realized_dd <= -DAILY_LOSS_LIMIT_PCT or intraday_dd <= -DAILY_DD_KILL_PCT
+    daily_risk_state["kill"] = kill
+    return kill, {"from_start": realized_dd, "from_peak": intraday_dd}
+
+
+def log_feature_attribution(instr, strategy_name, regime_mode, entry_type, score, sigs, spread_info, atr_info):
+    feature_attribution_log.append({
+        "ts": utc_now_iso(),
+        "instr": instr,
+        "strategy": strategy_name,
+        "regime_mode": regime_mode,
+        "entry_type": entry_type,
+        "score": float(score),
+        "spread": float(spread_info.get("spread", 0.0)),
+        "spread_pct": float(spread_info.get("percentile", 0.0)),
+        "atr_mult": float(atr_info.get("multiple", 0.0)),
+        "breakout": float(sigs.get("breakout", 0.0)),
+        "meanrev": float(sigs.get("meanrev", 0.0)),
+        "lux_draw": float(sigs.get("lux_draw", 0.0)),
+    })
 
 
 def edge_report(instr, score, regime, ev_guard, spr_info, beta_alpha, var_est, risk_mult, atrp):
@@ -2339,7 +2581,7 @@ async def fibplan_cmd(ctx, instrument: str):
 
 async def trade_once(instr):
     try:
-        refresh_pricing_once()  # keep spreads/prices fresh
+        refresh_pricing_once()
         df = get_candles(instr, count=500)
         if df is None or len(df) < 120:
             return
@@ -2347,34 +2589,48 @@ async def trade_once(instr):
         price = float(price_cache.get(instr, df["c"].iloc[-1]))
         price_cache[instr] = price
         atr_val = float(atr(df, ATR_PERIOD).iloc[-1] or 0.0)
+        nav, _ = get_nav()
 
-        # ---- build base signals
+        kill, kill_diag = daily_kill_switch_triggered(nav)
+        if kill:
+            log_event("RISK", instr, "Daily kill switch active", kill_diag, level=1)
+            return
+
         sigs, diag = build_signals(df, instr)
-
-        # ---- add compression / breakout alpha ON TOP of base sigs
         comp_s, _bw = compression_score(df["c"], n=BBANDS_N, q=SQUEEZE_Q)
         dirn, _lvl, brk_mag = breakout_signal(df, n=DONCHIAN_N)
-        # store auxiliary signals for visibility
-        sigs["compression"] = float(comp_s)                                # 0..1
-        sigs["breakout"]    = float(dirn * max(0.0, brk_mag))              # [-1..1], 0 if no break
-        # ---- Lux-style Liquidity Swings / Draw on Liquidity
-        lux = lux_draw_on_liquidity(df,
-                                    length=LIQ_SW_LENGTH,
-                                    area_mode="full" if LIQ_SW_AREA.lower().startswith("full") else "wick",
-                                    filter_by="volume" if LIQ_SW_FILTER.lower().startswith("vol") else "count",
-                                    threshold=LIQ_SW_THRESHOLD)
+        lux = lux_draw_on_liquidity(
+            df,
+            length=LIQ_SW_LENGTH,
+            area_mode="full" if LIQ_SW_AREA.lower().startswith("full") else "wick",
+            filter_by="volume" if LIQ_SW_FILTER.lower().startswith("vol") else "count",
+            threshold=LIQ_SW_THRESHOLD,
+        )
+        sigs["compression"] = float(comp_s)
+        sigs["breakout"] = float(dirn * max(0.0, brk_mag))
         sigs["lux_draw"] = round(float(lux["lux_draw"]), 3)
         sigs["lux_above_score"] = round(float(lux["lux_above_score"]), 3)
         sigs["lux_below_score"] = round(float(lux["lux_below_score"]), 3)
 
-
-        # ---- ensemble score
         score, regime_k, weights, pwin = ensemble_score(instr, df, sigs, diag)
-
-        # small bonus: prefer breakouts that occur during compression
         score = score + 0.25 * sigs["breakout"] * (0.5 + 0.5 * max(0.0, sigs["compression"]))
 
         reg_intraday, risk_mult = compute_intraday_regime(df)
+        mode = classify_regime_mode(regime_k, reg_intraday, atr_val, price)
+        strat = select_best_strategy(instr, df, sigs, score, mode)
+        if not strat or not strategy_enabled(strat["name"]):
+            log_event("DECISION", instr, "Skip: strategy disabled/no candidate", level=1)
+            return
+
+        mtf_votes, mtf_dir = mtf_direction_vote(instr)
+        direction = int(strat["direction"] if strat["direction"] != 0 else (1 if score >= 0 else -1))
+
+        strong_h1_against = mtf_votes.get("H1", 0) == -direction
+        aligned_count = sum(1 for v in mtf_votes.values() if v == direction)
+        breakout_exception = strat["name"] == "Breakout-Squeeze" and abs(sigs.get("breakout", 0.0)) > 0.35 and not strong_h1_against
+        if aligned_count < 2 and not breakout_exception:
+            log_event("GUARD", instr, "Blocked by MTF vote", {"votes": mtf_votes, "dir": direction}, level=1)
+            return
 
         set_cache(
             instr,
@@ -2382,123 +2638,134 @@ async def trade_once(instr):
                 "score": round(score, 3),
                 "regime": regime_k,
                 "pwin": round(pwin, 3),
+                "strategy": strat["name"],
+                "mode": mode,
                 **{k: round(float(sigs.get(k, 0)), 3) for k in sigs.keys()},
             },
             price,
         )
 
-        log_event(
-            "SCORE",
-            instr,
-            f"score={score:.2f}, pwin={pwin:.2f}, regime={regime_k}/{reg_intraday}, risk_mult={risk_mult:.2f}",
-            {"trend": round(sigs.get("trend", 0), 3),
-             "meanrev": round(sigs.get("meanrev", 0), 3),
-             "kalman": round(sigs.get("kalman", 0), 3),
-             "pos_skew": round(sigs.get("pos_skew", 0), 3),
-             "compression": round(sigs.get("compression", 0), 3),
-             "breakout": round(sigs.get("breakout", 0), 3)},
-            level=2
-        )
-
-        # ---- online ML update (supervised) – next bar sign
         ret1 = float(np.log(df["c"].iloc[-1] / df["c"].iloc[-2]))
         y = 1.0 if ret1 > 0 else 0.0
-        x = ml_features(df, sigs, diag)  # uses your original online-ML features
+        x = ml_features(df, sigs, diag)
         ml_update(instr, x, y)
 
-        # ======= GUARDS =======
         if count_open_positions(instr) >= MAX_POSITIONS_PER_INSTR:
             return
-
         if abs(score) < 0.25:
-            log_event("DECISION", instr, "Skip: |score|<0.25", level=1)
             return
-
         if strategy_sharpe() < SHARPE_FLOOR:
-            log_event("RISK", instr, f"Sharpe gate: {strategy_sharpe():.2f} < {SHARPE_FLOOR:.2f}", level=1)
             return
-
-        ev_guard = event_guardrails(instr)
-        if ev_guard:
+        if event_guardrails(instr) or event_guardrails_strict(instr):
             log_event("GUARD", instr, "Blocked by event window", level=1)
             return
 
         spr_block, spr_info = spread_liquidity_guard(instr)
-        if spr_block:
-            log_event("GUARD", instr, "Blocked by spread/stale", spr_info, level=1)
+        spr_pctl_block, spr_pctl_info = spread_percentile_guard(instr)
+        atr_spike, atr_diag = atr_spike_guard(df)
+        if spr_block or spr_pctl_block:
+            log_event("GUARD", instr, "Blocked by spread guard", {**spr_info, **spr_pctl_info}, level=1)
+            return
+        if atr_spike and strat["name"] != "Breakout-Squeeze":
+            log_event("GUARD", instr, "Blocked by ATR spike", atr_diag, level=1)
             return
 
         evc = edge_vs_cost(score, atr_val, price, instr)
-        if evc < MIN_EDGE_MULT_COST:
-            log_event("DECISION", instr, f"Skip: edge<cost ({evc:.2f}<{MIN_EDGE_MULT_COST:.2f})", {"evc": evc}, level=1)
+        min_edge = MIN_EDGE_MULT_COST * (1.2 if mode == "high_vol" else 1.0)
+        if evc < min_edge:
             return
 
         var_est = portfolio_var(price_cache, horizon_days=1, cl=0.99)
         if var_est["param"] > VAR_LIMIT_PCT:
-            log_event("RISK", instr, f"VaR gate {var_est['param']:.4f}>{VAR_LIMIT_PCT:.4f}", var_est, level=1)
             return
 
-                # ======= SIZING & EXECUTION =======
-        direction = 1 if score > 0 else -1
+        if idea_dedup_block(instr, direction):
+            log_event("DECISION", instr, "Skip: signal de-dup", {"dir": direction}, level=1)
+            return
+
+        heat = current_portfolio_heat(nav)
+        if heat >= PORTFOLIO_HEAT_LIMIT:
+            log_event("RISK", instr, "Portfolio heat limit", {"heat": heat}, level=1)
+            return
+        cluster_exp = currency_cluster_exposure_pct(nav, direction, instr)
+        if cluster_exp >= CLUSTER_HEAT_LIMIT:
+            log_event("RISK", instr, "Correlation/cluster cap", {"cluster_exp": cluster_exp}, level=1)
+            return
+
         units = units_from_risk(instr, price, atr_val, direction)
-        units = int(units * risk_mult)
+        regime_mult = 0.6 if mode == "high_vol" else 1.0
+        units = int(units * risk_mult * regime_mult)
         units = realized_vol_target(units, df)
         if units == 0:
             return
 
         tp, sl = tp_sl_levels(instr, price, atr_val, direction, score, sigs.get("fat_tails", 0.0))
-
-        # STOP-entry preference if breakouts under compression
-        resp = None
         order_plan = choose_order_for_breakout(instr, df, score)
-        if order_plan["use_stop"]:
-            aligned = (order_plan["dir"] > 0 and units > 0) or (order_plan["dir"] < 0 and units < 0)
-            if aligned:
-                resp = place_stop_entry_order(instr, units, price=order_plan["stop_price"], tp=tp, sl=sl)
-                log_event(
-                    "ORDER",
-                    instr,
-                    f"STOP entry @ {order_plan['stop_price']} (units={units}, tp={tp}, sl={sl})",
-                    {"comp_score": order_plan["comp_score"], "brk_mag": order_plan["brk_mag"]},
-                    level=1
-                )
-            else:
-                resp = place_market_order(instr, units, tp=tp, sl=sl)
-                log_event("ORDER", instr, f"MARKET (fallback, dir mismatch) units={units} tp={tp} sl={sl}", level=1)
-        else:
-            resp = place_market_order(instr, units, tp=tp, sl=sl)
-            log_event(
-                "ORDER",
-                instr,
-                f"MARKET units={units} tp={tp} sl={sl}",
-                {"price": price, "atr": atr_val, "direction": "BUY" if direction > 0 else "SELL"},
-                level=1
-            )
 
-        # --- Enforce RR ≥ 1.0 ---
-        entry_for_rr = order_plan["stop_price"] if order_plan["use_stop"] else price
+        entry_type = strat["entry_type"]
+        entry_level = price
+        if entry_type == "STOP" and order_plan.get("use_stop"):
+            entry_level = float(order_plan["stop_price"])
+        elif entry_type == "LIMIT":
+            ema_ref = float(ema(df["c"], EMA_PERIOD).iloc[-1])
+            entry_level = _round_price(instr, ema_ref)
+
+        sid = signal_id(instr, direction, strat["name"], entry_level)
+        if signal_id_seen(sid):
+            log_event("DECISION", instr, "Skip: idempotent signal", {"sid": sid}, level=1)
+            return
+
+        entry_for_rr = float(order_plan["stop_price"] if (entry_type == "STOP" and order_plan.get("use_stop")) else price)
         rr = abs(tp - entry_for_rr) / max(abs(entry_for_rr - sl), 1e-9)
         if rr < 1.0:
             log_event("DECISION", instr, f"Skip: RR={rr:.2f}<1.0", level=1)
             return
 
-        atrp = (atr_val / (price + 1e-9))
-        beta_alpha = compute_beta_alpha(instr)
-        rep = edge_report(instr, score, reg_intraday, ev_guard, spr_info, beta_alpha, var_est, risk_mult, atrp)
-        logger.info(f"[EDGE] {json.dumps(rep)[:400]}")
-        logger.info(f"[ORDER] {instr} units={units} tp={tp} sl={sl} resp={(json.dumps(resp) if resp else 'None')[:240]}")
+        resp = None
+        if entry_type == "STOP" and order_plan.get("use_stop"):
+            aligned = (order_plan["dir"] > 0 and units > 0) or (order_plan["dir"] < 0 and units < 0)
+            if aligned:
+                resp = place_stop_entry_order(instr, units, price=order_plan["stop_price"], tp=tp, sl=sl)
+            else:
+                resp = place_market_order(instr, units, tp=tp, sl=sl)
+        elif entry_type == "LIMIT":
+            resp = place_market_order(instr, units, tp=tp, sl=sl)
+        else:
+            resp = place_market_order(instr, units, tp=tp, sl=sl)
 
-        # PnL proxy for Sharpe / EXP3
+        trade_id = None
+        if isinstance(resp, dict):
+            fill = resp.get("orderFillTransaction") or {}
+            trade_opened = (fill.get("tradeOpened") or {})
+            trade_id = trade_opened.get("tradeID")
+        if trade_id:
+            trade_entry_meta[trade_id] = {
+                "ts": time.time(),
+                "strategy": strat["name"],
+                "score": score,
+                "entry_type": entry_type,
+                "be_moved": False,
+                "partial_taken": False,
+            }
+
+        log_feature_attribution(instr, strat["name"], mode, entry_type, score, sigs, spr_pctl_info, atr_diag)
+
+        atrp = atr_val / (price + 1e-9)
+        beta_alpha = compute_beta_alpha(instr)
+        rep = edge_report(instr, score, reg_intraday, False, spr_info, beta_alpha, var_est, risk_mult, atrp)
+        logger.info(f"[EDGE] {json.dumps(rep)[:400]}")
+        logger.info(f"[ORDER] {instr} strategy={strat['name']} type={entry_type} units={units} resp={(json.dumps(resp) if resp else 'None')[:240]}")
+
         last_ret = (df["c"].iloc[-1] - df["c"].iloc[-2]) / (df["c"].iloc[-2] + 1e-9)
-        trade_pnl_history.append(np.sign(direction) * last_ret)
+        signed_ret = np.sign(direction) * last_ret
+        trade_pnl_history.append(signed_ret)
+        strategy_perf[strat["name"]].append(signed_ret)
         reward = np.sign(score) * last_ret
         exp3_update(instr, {k: max(-0.01, min(0.01, reward)) for k in weights.keys()})
 
-    
-
-
     except Exception as e:
         logger.exception(f"trade_once error {instr}: {e}")
+
 
 async def auto_trader():
     global _last_closeout_date
@@ -3089,4 +3356,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
