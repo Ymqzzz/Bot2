@@ -77,10 +77,13 @@ def apply_portfolio_caps(proposal: Dict, open_positions: List[Dict], nav: float,
     positions.append(trial_position)
     expo = currency_exposure_matrix(positions)
 
-    net_total = sum(abs(v) for v in expo["net"].values()) + 1e-9
-    gross_total = sum(abs(v) for v in expo["gross"].values()) + 1e-9
-    worst_net = max([abs(v) / net_total for v in expo["net"].values()] + [0.0])
-    worst_gross = max([abs(v) / gross_total for v in expo["gross"].values()] + [0.0])
+    # Compare exposures against account size instead of exposure-share-of-exposure.
+    # In FX every position creates two offsetting currency legs, so share-based
+    # normalization (sum(abs(net))) makes the largest currency share >= 0.5 and
+    # can trivially block every proposal with realistic caps such as 0.30-0.40.
+    nav_denom = max(float(nav), 1e-9)
+    worst_net = max([abs(v) / nav_denom for v in expo["net"].values()] + [0.0])
+    worst_gross = max([abs(v) / nav_denom for v in expo["gross"].values()] + [0.0])
 
     cluster = cluster_for_instrument(proposal["instrument"])
     corr_pen = correlation_penalty(proposal["instrument"], open_positions, corr_matrix, limits.corr_threshold)
