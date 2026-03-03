@@ -1,0 +1,10 @@
+{
+  "strategy": {
+    "core": {
+      "a": 1.0,
+      "b": 0.0,
+      "brier_raw": 0.25,
+      "brier_calibrated": 0.25
+    }
+  }
+}

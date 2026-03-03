@@ -1,10 +1,12 @@
 # ========== IMPORTS ==========
+import os, time, requests, asyncio, logging, math, json, statistics, sys
 import os, time, requests, asyncio, logging, math, json, statistics, hashlib
 import pandas as pd
 import numpy as np
 import discord
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from discord.ext import commands
 from flask import Flask, render_template_string, request, jsonify
 from threading import Thread
@@ -12,6 +14,9 @@ from collections import deque, defaultdict
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import brier_score_loss
+from sklearn.ensemble import GradientBoostingRegressor
 
 
 # ========= CONFIG =========
@@ -108,6 +113,18 @@ def _rf(code):
 RF = {c: _rf(c) for c in ["USD","EUR","GBP","JPY","AUD","CHF","CAD","NZD"]}
 
 HOST = os.environ.get("OANDA_HOST", "https://api-fxpractice.oanda.com/v3")
+WF_STATE_PATH = os.environ.get("WF_STATE_PATH", "walk_forward_state.json")
+CALIBRATION_STATE_PATH = os.environ.get("CALIBRATION_STATE_PATH", "research_outputs/calibration.json")
+QUANTILE_STATE_PATH = os.environ.get("QUANTILE_STATE_PATH", "research_outputs/quantile_runtime.json")
+
+DEFAULT_SAFE_PROFILE = {
+    "min_score": 0.25,
+    "min_rr": 1.0,
+    "min_pwin": 0.50,
+    "time_stop_bars": 6,
+}
+
+runtime_state_cache = {"ts": 0.0, "profiles": {}, "quantile": {}, "calibration": {}}
 
 # ======== COMMENTARY CONFIG ========
 SUMMARY_EVERY_SEC = int(os.environ.get("SUMMARY_EVERY_SEC", "120"))  # default 2min
@@ -570,6 +587,53 @@ def set_cache(instr, signal, price):
     price_cache[instr] = price
     cache_timestamp[instr] = time.time()
 
+
+def _read_json(path: str):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def refresh_runtime_state(force=False):
+    now = time.time()
+    if not force and now - runtime_state_cache.get("ts", 0.0) < 30:
+        return runtime_state_cache
+    runtime_state_cache["profiles"] = _read_json(WF_STATE_PATH)
+    runtime_state_cache["quantile"] = _read_json(QUANTILE_STATE_PATH)
+    runtime_state_cache["calibration"] = _read_json(CALIBRATION_STATE_PATH)
+    runtime_state_cache["ts"] = now
+    return runtime_state_cache
+
+
+def get_strategy_profile(strategy_name="core"):
+    st = refresh_runtime_state().get("profiles", {})
+    strat = (st.get("strategies") or {}).get(strategy_name, {})
+    chosen = strat.get("selected_profile")
+    profiles = st.get("profiles") or {}
+    return profiles.get(chosen, DEFAULT_SAFE_PROFILE)
+
+
+def calibrate_pwin(strategy_name: str, raw_pwin: float):
+    cal = refresh_runtime_state().get("calibration", {})
+    per = (cal.get("strategy") or {}).get(strategy_name, {})
+    a = float(per.get("a", 1.0))
+    b = float(per.get("b", 0.0))
+    z = a * raw_pwin + b
+    out = 1.0 / (1.0 + math.exp(-z))
+    return float(max(0.001, min(0.999, out)))
+
+
+def get_quantile_hint(instr: str):
+    q = refresh_runtime_state().get("quantile", {})
+    by_ins = (q.get("instrument") or {}).get(instr, {})
+    return {
+        "q10": float(by_ins.get("q10", 0.0)),
+        "q50": float(by_ins.get("q50", 0.0)),
+        "q90": float(by_ins.get("q90", 0.0)),
+    }
+
 # ========= SMALL UTILS =========
 
 def utc_now_iso():
@@ -1012,6 +1076,7 @@ def safe_put(url, json_data=None, retries=3):
 
 # --- Timezone (NY) ---
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
     NY_TZ = ZoneInfo("America/New_York")
@@ -3290,6 +3355,10 @@ async def trade_once(instr):
         score, regime_k, weights, pwin = ensemble_score(instr, df, sigs, diag)
         score = score + 0.25 * sigs["breakout"] * (0.5 + 0.5 * max(0.0, sigs["compression"]))
 
+        profile = get_strategy_profile("core")
+        calibrated_pwin = calibrate_pwin("core", float(pwin))
+        qhint = get_quantile_hint(instr)
+
         reg_intraday, risk_mult = compute_intraday_regime(df)
         strategy_name = detect_strategy_profile(sigs, score)
         if not strategy_allowed_in_session(strategy_name, session_name):
@@ -3324,6 +3393,10 @@ async def trade_once(instr):
                 "score": round(score, 3),
                 "regime": regime_k,
                 "pwin": round(pwin, 3),
+                "pwin_cal": round(calibrated_pwin, 3),
+                "q10": round(qhint.get("q10", 0.0), 5),
+                "q50": round(qhint.get("q50", 0.0), 5),
+                "q90": round(qhint.get("q90", 0.0), 5),
                 "session": session_name,
                 "strategy_profile": strategy_name,
                 **{k: round(float(sigs.get(k, 0)), 3) for k in sigs.keys()},
@@ -3341,6 +3414,13 @@ async def trade_once(instr):
         log_event(
             "SCORE",
             instr,
+            f"score={score:.2f}, pwin={pwin:.2f}/{calibrated_pwin:.2f}, regime={regime_k}/{reg_intraday}, risk_mult={risk_mult:.2f}",
+            {"trend": round(sigs.get("trend", 0), 3),
+             "meanrev": round(sigs.get("meanrev", 0), 3),
+             "kalman": round(sigs.get("kalman", 0), 3),
+             "pos_skew": round(sigs.get("pos_skew", 0), 3),
+             "compression": round(sigs.get("compression", 0), 3),
+             "breakout": round(sigs.get("breakout", 0), 3)},
             f"score={score:.2f}, pwin={pwin:.2f}, regime={regime_k}/{reg_intraday}, session={session_name}",
             {"strategy": strategy_name, "session": session_info, "risk_mult": risk_mult},
             level=2
@@ -3354,6 +3434,20 @@ async def trade_once(instr):
         if count_open_positions(instr) >= MAX_POSITIONS_PER_INSTR:
             return
 
+        min_score = float(profile.get("min_score", 0.25))
+        if abs(score) < min_score:
+            log_event("DECISION", instr, f"Skip: |score|<{min_score:.2f}", level=1)
+            return
+
+        if calibrated_pwin < float(profile.get("min_pwin", 0.50)):
+            log_event("DECISION", instr, f"Skip: calibrated pwin gate {calibrated_pwin:.2f}", level=1)
+            return
+
+        if score > 0 and qhint.get("q50", 0.0) < 0:
+            log_event("DECISION", instr, "Skip: long conflicts with q50", qhint, level=1)
+            return
+        if score < 0 and qhint.get("q50", 0.0) > 0:
+            log_event("DECISION", instr, "Skip: short conflicts with q50", qhint, level=1)
         if abs(score) < 0.25:
             log_event("DECISION", instr, "Skip: |score|<0.25", {"session": session_name}, level=1)
             return
@@ -3383,6 +3477,7 @@ async def trade_once(instr):
             log_event("RISK", instr, f"VaR gate {var_est['param']:.4f}>{VAR_LIMIT_PCT:.4f}", {"session": session_name, **var_est}, level=1)
             return
 
+        # ======= SIZING & EXECUTION =======
         direction = 1 if score > 0 else -1
         confidence = min(0.95, max(0.05, 0.5 + 0.5 * abs(score)))
         evr = abs(score) * evc
@@ -3412,6 +3507,25 @@ async def trade_once(instr):
             return
 
         tp, sl = tp_sl_levels(instr, price, atr_val, direction, score, sigs.get("fat_tails", 0.0))
+        if qhint:
+            if direction > 0:
+                qsl = price * (1.0 + float(qhint.get("q10", 0.0)))
+                qtp = price * (1.0 + float(qhint.get("q90", 0.0)))
+            else:
+                qsl = price * (1.0 + float(qhint.get("q90", 0.0)))
+                qtp = price * (1.0 + float(qhint.get("q10", 0.0)))
+            if abs(qtp - price) > 1e-9 and abs(price - qsl) > 1e-9:
+                tp, sl = qtp, qsl
+
+        # STOP-entry preference if breakouts under compression
+        order_plan = choose_order_for_breakout(instr, df, score)
+
+        # --- Enforce RR before any order placement ---
+        entry_for_rr = order_plan["stop_price"] if order_plan["use_stop"] else price
+        rr = abs(tp - entry_for_rr) / max(abs(entry_for_rr - sl), 1e-9)
+        min_rr = float(profile.get("min_rr", 1.0))
+        if rr < min_rr:
+            log_event("DECISION", instr, f"Skip: RR={rr:.2f}<{min_rr:.2f}", level=1)
         tp, sl, orderflow, wall_notes = adjust_tp_sl_with_walls(instr, price, tp, sl, direction, atr_val, orderflow)
 
         order_plan = choose_order_for_breakout(instr, df, score)
@@ -3427,6 +3541,25 @@ async def trade_once(instr):
             aligned = (order_plan["dir"] > 0 and units > 0) or (order_plan["dir"] < 0 and units < 0)
             if aligned:
                 resp = place_stop_entry_order(instr, units, price=order_plan["stop_price"], tp=tp, sl=sl)
+                log_event(
+                    "ORDER",
+                    instr,
+                    f"STOP entry @ {order_plan['stop_price']} (units={units}, tp={tp}, sl={sl})",
+                    {"comp_score": order_plan["comp_score"], "brk_mag": order_plan["brk_mag"], "rr": round(rr, 3)},
+                    level=1
+                )
+            else:
+                resp = place_market_order(instr, units, tp=tp, sl=sl)
+                log_event("ORDER", instr, f"MARKET (fallback, dir mismatch) units={units} tp={tp} sl={sl}", {"rr": round(rr, 3)}, level=1)
+        else:
+            resp = place_market_order(instr, units, tp=tp, sl=sl)
+            log_event(
+                "ORDER",
+                instr,
+                f"MARKET units={units} tp={tp} sl={sl}",
+                {"price": price, "atr": atr_val, "direction": "BUY" if direction > 0 else "SELL", "rr": round(rr, 3)},
+                level=1
+            )
                 log_event("ORDER", instr, f"STOP entry @ {order_plan['stop_price']} (units={units}, tp={tp}, sl={sl})",
                           {"session": session_name, "strategy": strategy_name, "confidence": round(confidence, 3),
                            "orderflow_available": orderflow.get("available"), "orderflow_notes": off_notes + wall_notes}, level=1)
@@ -4091,9 +4224,389 @@ async def _run_schedules_once():
     for sid in to_del:
         slice_sched.pop(sid, None)
 
+
+# ========= RESEARCH / REPLAY ENGINE =========
+
+class ReplayMarketDataProvider:
+    def __init__(self, candles_by_instr):
+        self.data = {}
+        for ins, df in candles_by_instr.items():
+            t = df.copy()
+            t["time"] = pd.to_datetime(t["time"], utc=True)
+            self.data[ins] = t.sort_values("time").reset_index(drop=True)
+
+    def _resample(self, df, timeframe):
+        if timeframe == "M5":
+            return df
+        rule = {"M15": "15min", "H1": "1h"}.get(timeframe, "5min")
+        return (
+            df.set_index("time")
+              .resample(rule)
+              .agg({"o":"first","h":"max","l":"min","c":"last","v":"sum"})
+              .dropna()
+              .reset_index()
+        )
+
+    def get_window(self, instrument, timeframe, end_idx, bars):
+        base = self.data[instrument].iloc[: end_idx + 1]
+        return self._resample(base, timeframe).tail(bars).copy()
+
+
+class ReplayExecutionProvider:
+    def execute(self, plan, next_bar, spread):
+        side = 1 if plan["direction"] > 0 else -1
+        slip = spread / 2.0
+        t = plan.get("type", "MARKET")
+        if t == "MARKET":
+            return {"filled": True, "entry_price": float(next_bar["o"]) + side * slip}
+        if t == "LIMIT":
+            touched = next_bar["l"] <= plan["price"] <= next_bar["h"]
+            return {"filled": touched, "entry_price": float(plan["price"] + side * 0.1 * slip)}
+        if t == "STOP":
+            touched = next_bar["l"] <= plan["price"] <= next_bar["h"]
+            return {"filled": touched, "entry_price": float(plan["price"] + side * slip)}
+        return {"filled": False}
+
+
+class ProbabilityCalibratorWF:
+    def __init__(self):
+        self.model = LogisticRegression(max_iter=200)
+        self.iso = IsotonicRegression(out_of_bounds="clip")
+        self.ready = False
+
+    def fit(self, p_raw, y):
+        x = np.asarray(p_raw).reshape(-1, 1)
+        y = np.asarray(y).astype(int)
+        if len(np.unique(y)) < 2:
+            self.ready = False
+            return
+        self.model.fit(x, y)
+        p = self.model.predict_proba(x)[:, 1]
+        self.iso.fit(p, y)
+        self.ready = True
+
+    def predict_one(self, p_raw):
+        if not self.ready:
+            return float(p_raw)
+        p = self.model.predict_proba(np.array([[float(p_raw)]]))[:, 1][0]
+        return float(self.iso.predict([p])[0])
+
+
+class QuantileHeadWF:
+    def __init__(self):
+        self.models = {
+            "q10": GradientBoostingRegressor(loss="quantile", alpha=0.1, random_state=7),
+            "q50": GradientBoostingRegressor(loss="quantile", alpha=0.5, random_state=7),
+            "q90": GradientBoostingRegressor(loss="quantile", alpha=0.9, random_state=7),
+        }
+        self.ready = False
+
+    def fit(self, X, y):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        if len(y) < 30:
+            self.ready = False
+            return
+        for m in self.models.values():
+            m.fit(X, y)
+        self.ready = True
+
+    def predict_one(self, x):
+        if not self.ready:
+            return {"q10": 0.0, "q50": 0.0, "q90": 0.0}
+        x = np.asarray(x).reshape(1, -1)
+        return {k: float(m.predict(x)[0]) for k, m in self.models.items()}
+
+
+def wf_features(df_m5):
+    r = np.log(df_m5["c"] / df_m5["c"].shift(1)).dropna()
+    return np.array([
+        float(r.tail(6).mean() if len(r) else 0.0),
+        float(r.tail(20).std() if len(r) else 0.0),
+        float((df_m5["c"].iloc[-1] / (df_m5["c"].iloc[-20] + 1e-9)) - 1.0),
+        float((df_m5["h"].tail(10).max() - df_m5["l"].tail(10).min()) / (df_m5["c"].iloc[-1] + 1e-9)),
+    ])
+
+
+def run_research_backtest(data_dir, out_dir="research_outputs", wf_state_path=WF_STATE_PATH):
+    candles = {}
+    for f in Path(data_dir).glob("*.csv"):
+        candles[f.stem] = pd.read_csv(f)
+    if not candles:
+        raise RuntimeError("No CSV candles found")
+
+    profiles = {
+        "conservative": {"min_score": 0.35, "min_rr": 1.25, "min_pwin": 0.57, "time_stop_bars": 6},
+        "default": {"min_score": 0.25, "min_rr": 1.00, "min_pwin": 0.52, "time_stop_bars": 6},
+        "aggressive": {"min_score": 0.15, "min_rr": 0.90, "min_pwin": 0.50, "time_stop_bars": 8},
+    }
+
+    md = ReplayMarketDataProvider(candles)
+    ex = ReplayExecutionProvider()
+
+    def simulate_profile(df, profile_name, profile, start_i, end_i, cal, qh, instrument):
+        trades = []
+        eq = [1.0]
+        calib = []
+        q_last = {"q10": 0.0, "q50": 0.0, "q90": 0.0}
+        for i in range(start_i, min(end_i, len(df) - 8)):
+            w = md.get_window(instrument, "M5", i, 120)
+            x = wf_features(w)
+            q = qh.predict_one(x)
+            q_last = q
+            raw_p = float((np.tanh(x[0] / (x[1] + 1e-9)) + 1.0) / 2.0)
+            cal_p = cal.predict_one(raw_p)
+            score = float(np.tanh(x[0] / (x[1] + 1e-9)))
+            if abs(score) < profile["min_score"] or cal_p < profile["min_pwin"]:
+                continue
+            direction = 1 if score > 0 else -1
+            if (direction > 0 and q["q50"] <= 0) or (direction < 0 and q["q50"] >= 0):
+                continue
+            rr = abs(q["q90"]) / max(abs(q["q10"]), 1e-6)
+            if rr < profile["min_rr"]:
+                continue
+
+            entry_ref = float(df["c"].iloc[i])
+            sl = entry_ref * (1.0 + (q["q10"] if direction > 0 else q["q90"]))
+            tp = entry_ref * (1.0 + (q["q90"] if direction > 0 else q["q10"]))
+            spread_mult = 1.8 if pd.to_datetime(df["time"].iloc[i]).hour in (21, 22, 23, 0, 1) else 1.0
+            spread = float(entry_ref * 0.00006 * spread_mult)
+            fill = ex.execute({"type": "MARKET", "direction": direction}, df.iloc[i + 1], spread)
+            if not fill.get("filled"):
+                continue
+            entry = float(fill["entry_price"])
+
+            exit_px = float(df["c"].iloc[i + 6])
+            exit_t = str(df["time"].iloc[i + 6])
+            for j in range(i + 1, min(i + 7, len(df))):
+                hi, lo = float(df["h"].iloc[j]), float(df["l"].iloc[j])
+                if direction > 0 and lo <= sl:
+                    exit_px = sl - spread / 2
+                    exit_t = str(df["time"].iloc[j])
+                    break
+                if direction > 0 and hi >= tp:
+                    exit_px = tp - spread / 2
+                    exit_t = str(df["time"].iloc[j])
+                    break
+                if direction < 0 and hi >= sl:
+                    exit_px = sl + spread / 2
+                    exit_t = str(df["time"].iloc[j])
+                    break
+                if direction < 0 and lo <= tp:
+                    exit_px = tp + spread / 2
+                    exit_t = str(df["time"].iloc[j])
+                    break
+
+            risk = max(abs(entry - sl), 1e-9)
+            r_mult = direction * (exit_px - entry) / risk
+            eq.append(eq[-1] * (1.0 + 0.01 * r_mult))
+            trades.append({
+                "instrument": instrument,
+                "strategy": "core",
+                "profile": profile_name,
+                "direction": direction,
+                "entry_time": str(df["time"].iloc[i + 1]),
+                "entry_price": entry,
+                "exit_time": exit_t,
+                "exit_price": exit_px,
+                "spread_cost": spread,
+                "fees": 0.0,
+                "r_multiple": r_mult,
+                "raw_pwin": raw_p,
+                "calibrated_pwin": cal_p,
+                "q10": q["q10"],
+                "q50": q["q50"],
+                "q90": q["q90"],
+            })
+            calib.append({"raw_pwin": raw_p, "calibrated_pwin": cal_p, "y": 1 if r_mult > 0 else 0, "r": r_mult})
+        return trades, eq, calib, q_last
+
+    all_trades = []
+    equity = [1.0]
+    calib_rows = []
+    q_runtime = {"instrument": {}}
+    wf_rows = []
+
+    for ins, df in md.data.items():
+        if len(df) < 260:
+            continue
+
+        # model training set for quantiles + calibration
+        X_train, y_train, p_train = [], [], []
+        for i in range(60, min(180, len(df) - 7)):
+            w = md.get_window(ins, "M5", i, 120)
+            x = wf_features(w)
+            fwd = float(df["c"].iloc[i + 6] / (df["c"].iloc[i] + 1e-9) - 1.0)
+            raw = float((np.tanh(x[0] / (x[1] + 1e-9)) + 1.0) / 2.0)
+            X_train.append(x)
+            y_train.append(fwd)
+            p_train.append(raw)
+
+        cal = ProbabilityCalibratorWF()
+        qh = QuantileHeadWF()
+        qh.fit(X_train, y_train)
+        y_bin = (np.array(y_train) > 0).astype(int)
+        cal.fit(p_train, y_bin)
+
+        # walk-forward: rolling train 30 days / test 5 days in M5 bars
+        train_bars = 30 * 24 * 12
+        test_bars = 5 * 24 * 12
+        start = max(180, len(df) - (train_bars + 3 * test_bars))
+        stable_changes = 0
+        last_selected = None
+
+        while start + train_bars + test_bars < len(df) - 8:
+            train_start = start
+            train_end = start + train_bars
+            test_end = train_end + test_bars
+
+            profile_scores = []
+            for pname, prof in profiles.items():
+                tr_trades, tr_eq, _, _ = simulate_profile(df, pname, prof, train_start, train_end, cal, qh, ins)
+                if not tr_trades:
+                    profile_scores.append({"profile": pname, "expectancy": -999.0, "max_drawdown": -1.0, "trades": 0})
+                    continue
+                tr_df = pd.DataFrame(tr_trades)
+                exp = float(tr_df["r_multiple"].mean())
+                dd = float((pd.Series(tr_eq) / pd.Series(tr_eq).cummax() - 1.0).min())
+                tr_count = int(len(tr_df))
+                if tr_count < 8:
+                    exp -= 0.2
+                if dd < -0.10:
+                    exp -= 0.1
+                profile_scores.append({"profile": pname, "expectancy": exp, "max_drawdown": dd, "trades": tr_count})
+
+            score_tbl = pd.DataFrame(profile_scores).sort_values(["expectancy", "max_drawdown"], ascending=[False, False])
+            selected = score_tbl.iloc[0]["profile"] if not score_tbl.empty else "default"
+            if last_selected is not None and selected != last_selected:
+                stable_changes += 1
+            last_selected = selected
+
+            te_trades, te_eq, te_calib, q_last = simulate_profile(df, selected, profiles[selected], train_end, test_end, cal, qh, ins)
+            if te_trades:
+                all_trades.extend(te_trades)
+                for x in te_eq[1:]:
+                    equity.append(equity[-1] * (x / te_eq[0]))
+                calib_rows.extend([{"strategy": "core", "instrument": ins, **c} for c in te_calib])
+                q_runtime["instrument"][ins] = q_last
+                te_df = pd.DataFrame(te_trades)
+                wf_rows.append({
+                    "instrument": ins,
+                    "selected_profile": selected,
+                    "oos_expectancy": float(te_df["r_multiple"].mean()),
+                    "oos_trades": int(len(te_df)),
+                    "stability_changes": stable_changes,
+                })
+
+            start += test_bars
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    ledger = pd.DataFrame(all_trades)
+    ledger.to_csv(out / "trade_ledger.csv", index=False)
+    ledger.to_json(out / "trade_ledger.json", orient="records")
+    pd.DataFrame({"equity": equity}).to_csv(out / "equity_curve.csv", index=False)
+
+    stats = {}
+    if not ledger.empty:
+        g = ledger
+        win_rate = float((g["r_multiple"] > 0).mean())
+        avg_r = float(g["r_multiple"].mean())
+        dd = float((pd.Series(equity) / pd.Series(equity).cummax() - 1.0).min())
+        loss_sum = abs(float(g[g["r_multiple"] <= 0]["r_multiple"].sum()))
+        pf = float(g[g["r_multiple"] > 0]["r_multiple"].sum() / (loss_sum if loss_sum > 0 else 1e-9))
+        trades_per_day = float(len(g) / max(1, pd.to_datetime(g["entry_time"]).dt.date.nunique()))
+        stats["core"] = {
+            "win_rate": win_rate,
+            "avg_r": avg_r,
+            "expectancy": avg_r,
+            "max_drawdown": dd,
+            "profit_factor": pf,
+            "trades_per_day": trades_per_day,
+            "trades": int(len(g)),
+        }
+
+    cal_df = pd.DataFrame(calib_rows)
+    if not cal_df.empty:
+        brier_raw = float(brier_score_loss(cal_df["y"], np.clip(cal_df["raw_pwin"], 1e-6, 1 - 1e-6)))
+        brier_cal = float(brier_score_loss(cal_df["y"], np.clip(cal_df["calibrated_pwin"], 1e-6, 1 - 1e-6)))
+        bins = np.linspace(0, 1, 6)
+        cal_df["bin"] = pd.cut(cal_df["calibrated_pwin"], bins=bins, include_lowest=True)
+        reliability = []
+        for b, grp in cal_df.groupby("bin", observed=False):
+            if len(grp) == 0:
+                continue
+            reliability.append({"bin": str(b), "pred": float(grp["calibrated_pwin"].mean()), "realized": float(grp["y"].mean()), "n": int(len(grp))})
+    else:
+        brier_raw = brier_cal = 0.25
+        reliability = []
+
+    a_coef = 1.0
+    b_coef = 0.0
+    if not cal_df.empty and cal_df["y"].nunique() > 1:
+        lr = LogisticRegression(max_iter=200)
+        lr.fit(np.array(cal_df["raw_pwin"]).reshape(-1, 1), np.array(cal_df["y"]).astype(int))
+        a_coef = float(lr.coef_[0][0])
+        b_coef = float(lr.intercept_[0])
+
+    (out / "stats.json").write_text(json.dumps(stats, indent=2))
+    (out / "calibration.json").write_text(json.dumps({
+        "strategy": {
+            "core": {
+                "a": a_coef,
+                "b": b_coef,
+                "brier_raw": brier_raw,
+                "brier_calibrated": brier_cal,
+                "reliability_bins": reliability,
+            }
+        }
+    }, indent=2))
+    (out / "quantile_runtime.json").write_text(json.dumps(q_runtime, indent=2))
+
+    wf_df = pd.DataFrame(wf_rows)
+    if wf_df.empty:
+        selected_profile = "default"
+        oos_exp = 0.0
+        enabled = False
+        stability_changes = 0
+    else:
+        prof_summary = wf_df.groupby("selected_profile", as_index=False).agg(
+            oos_expectancy=("oos_expectancy", "mean"),
+            oos_trades=("oos_trades", "sum"),
+            stability_changes=("stability_changes", "max"),
+        ).sort_values(["oos_expectancy", "oos_trades"], ascending=[False, False])
+        top = prof_summary.iloc[0]
+        selected_profile = str(top["selected_profile"])
+        oos_exp = float(top["oos_expectancy"])
+        enabled = bool(oos_exp > 0 and int(top["oos_trades"]) >= 10)
+        stability_changes = int(top["stability_changes"])
+
+    wf_state = {
+        "generated_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        "profiles": profiles,
+        "strategies": {
+            "core": {
+                "selected_profile": selected_profile,
+                "oos_expectancy": oos_exp,
+                "enabled": enabled,
+                "stability_changes": stability_changes,
+            }
+        }
+    }
+    Path(wf_state_path).write_text(json.dumps(wf_state, indent=2))
+    print("Research run done.")
+
+
 # ========= MAIN =========
 
 def main():
+    if "--research" in sys.argv:
+        idx = sys.argv.index("--research")
+        data_dir = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else os.environ.get("RESEARCH_DATA_DIR", "")
+        if not data_dir:
+            raise RuntimeError("Provide data dir: python main.py --research <dir>")
+        run_research_backtest(data_dir=data_dir, out_dir=os.environ.get("RESEARCH_OUT_DIR", "research_outputs"), wf_state_path=WF_STATE_PATH)
+        return
     if not all([DISCORD_TOKEN, OANDA_API_KEY, OANDA_ACCOUNTID]):
         raise RuntimeError("Missing environment variables...")
     bot.run(DISCORD_TOKEN)

@@ -1,0 +1,31 @@
+{
+  "generated_at": "bootstrap",
+  "profiles": {
+    "conservative": {
+      "min_score": 0.35,
+      "min_rr": 1.25,
+      "min_pwin": 0.57,
+      "time_stop_bars": 6
+    },
+    "default": {
+      "min_score": 0.25,
+      "min_rr": 1.0,
+      "min_pwin": 0.52,
+      "time_stop_bars": 6
+    },
+    "aggressive": {
+      "min_score": 0.15,
+      "min_rr": 0.9,
+      "min_pwin": 0.5,
+      "time_stop_bars": 8
+    }
+  },
+  "strategies": {
+    "core": {
+      "selected_profile": "default",
+      "oos_expectancy": 0.0,
+      "enabled": true,
+      "stability_changes": 0
+    }
+  }
+}
