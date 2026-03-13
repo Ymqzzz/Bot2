@@ -34,7 +34,10 @@ def currency_exposure_matrix(positions: List[Dict]) -> Dict[str, Dict[str, float
     gross = {}
     for p in positions:
         instr = p.get("instrument", "")
-        units = float(p.get("units", 0.0))
+        try:
+            units = float(p.get("units", 0.0))
+        except (TypeError, ValueError):
+            continue
         if "_" not in instr:
             continue
         base, quote = pair_currencies(instr)
@@ -46,7 +49,13 @@ def currency_exposure_matrix(positions: List[Dict]) -> Dict[str, Dict[str, float
 
 
 def estimate_risk_cost(entry: float, stop_loss: float, units: float, nav: float, corr_penalty: float = 1.0) -> float:
-    risk_value = abs(entry - stop_loss) * abs(units)
+    try:
+        units_f = float(units)
+        entry_f = float(entry)
+        stop_f = float(stop_loss)
+    except (TypeError, ValueError):
+        return 0.0
+    risk_value = abs(entry_f - stop_f) * abs(units_f)
     return (risk_value / max(nav, 1e-9)) * max(1.0, corr_penalty)
 
 
@@ -72,8 +81,20 @@ def correlation_penalty(instr: str, open_positions: List[Dict], corr_matrix: Dic
 
 
 def apply_portfolio_caps(proposal: Dict, open_positions: List[Dict], nav: float, corr_matrix: Dict[str, Dict[str, float]], limits: PortfolioLimits) -> Dict:
+    instrument = proposal.get("instrument")
+    entry_price = proposal.get("entry_price")
+    stop_loss = proposal.get("stop_loss")
+    if not instrument or entry_price is None or stop_loss is None:
+        out = dict(proposal)
+        out["blocked"] = True
+        out["block_reason"] = "invalid_proposal:missing_required_fields"
+        out["risk_cost"] = 0.0
+        out["correlation_cluster_id"] = cluster_for_instrument(str(instrument or ""))
+        out["exposure_snapshot"] = {"net": {}, "gross": {}, "worst_net": 0.0, "worst_gross": 0.0}
+        return out
+
     positions = list(open_positions)
-    trial_position = {"instrument": proposal["instrument"], "units": proposal.get("signed_units", 0)}
+    trial_position = {"instrument": instrument, "units": proposal.get("signed_units", 0)}
     positions.append(trial_position)
     expo = currency_exposure_matrix(positions)
 
@@ -85,9 +106,9 @@ def apply_portfolio_caps(proposal: Dict, open_positions: List[Dict], nav: float,
     worst_net = max([abs(v) / nav_denom for v in expo["net"].values()] + [0.0])
     worst_gross = max([abs(v) / nav_denom for v in expo["gross"].values()] + [0.0])
 
-    cluster = cluster_for_instrument(proposal["instrument"])
-    corr_pen = correlation_penalty(proposal["instrument"], open_positions, corr_matrix, limits.corr_threshold)
-    risk_cost = estimate_risk_cost(proposal["entry_price"], proposal["stop_loss"], proposal.get("signed_units", 0), nav, corr_pen)
+    cluster = cluster_for_instrument(instrument)
+    corr_pen = correlation_penalty(instrument, open_positions, corr_matrix, limits.corr_threshold)
+    risk_cost = estimate_risk_cost(float(entry_price), float(stop_loss), proposal.get("signed_units", 0), nav, corr_pen)
 
     out = dict(proposal)
     out["correlation_cluster_id"] = cluster
