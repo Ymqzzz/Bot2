@@ -1,6 +1,15 @@
 # ========== IMPORTS ==========
-import os, time, requests, asyncio, logging, math, json, statistics, sys
-import os, time, requests, asyncio, logging, math, json, statistics, hashlib
+import asyncio
+import hashlib
+import json
+import logging
+import math
+import os
+import statistics
+import sys
+import time
+
+import requests
 import pandas as pd
 import numpy as np
 import discord
@@ -162,7 +171,6 @@ def llm_rewrite_summary(plain_summary: str) -> str:
     if not api_key:
         return plain_summary
     try:
-        import requests, json
         url = "https://api.openai.com/v1/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {
