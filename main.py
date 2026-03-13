@@ -3166,7 +3166,18 @@ def fetch_pnl_series(n: int = 100) -> pd.Series:
 ml_model = None
 scaler = None
 ml_last_train = 0
-ML_FEATURE_NAMES = ["ret", "atrp", "vol5", "vol30", "regime_trend"]
+ML_FEATURE_NAMES = [
+    "ret",
+    "atrp",
+    "vol5",
+    "vol30",
+    "regime_trend",
+    "zscore20",
+    "mom3",
+    "mom10",
+    "ema_spread",
+    "rsi14",
+]
 
 def extract_features(df):
     """Builds ML-ready feature set from candle DataFrame."""
@@ -3176,28 +3187,48 @@ def extract_features(df):
     df["vol5"] = df["ret"].rolling(5).std(ddof=1)
     df["vol30"] = df["ret"].rolling(30).std(ddof=1)
     df["regime_trend"] = np.where(df["c"] > df["c"].rolling(20).mean(), 1, 0)
+    df["zscore20"] = (df["c"] - df["c"].rolling(20).mean()) / (df["c"].rolling(20).std(ddof=1) + 1e-9)
+    df["mom3"] = df["c"].pct_change(3)
+    df["mom10"] = df["c"].pct_change(10)
+    df["ema_spread"] = (ema(df["c"], 10) - ema(df["c"], 30)) / (df["c"] + 1e-9)
+    df["rsi14"] = rsi(df["c"], 14) / 100.0
+    df["target"] = np.where(df["ret"].shift(-1) > 0, 1, 0)
     df.dropna(inplace=True)
-    X = df[["ret", "atrp", "vol5", "vol30", "regime_trend"]]
-    y = np.where(df["ret"].shift(-1) > 0, 1, 0)
-    y = y[:len(X)]
+    X = df[ML_FEATURE_NAMES]
+    y = df["target"].astype(int).values
     return X.values, y
 
 def train_ml_model(instr="EUR_USD", window=500):
-    """Retrains the logistic model from latest candles."""
+    """Retrains stacked classification models from latest candles."""
     global ml_model, ml_last_train
     df = get_candles(instr, count=window)
     if df is None or len(df) < 60:
         return None
     X, y = extract_features(df)
-    model = Pipeline([
+    if len(X) < 80:
+        return None
+
+    lr_model = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=200))
     ])
-    model.fit(X, y)
-    ml_model = model
+    gb_model = GradientBoostingRegressor(
+        n_estimators=120,
+        learning_rate=0.05,
+        max_depth=2,
+        random_state=42,
+    )
+
+    lr_model.fit(X, y)
+    gb_model.fit(X, y)
+
+    ml_model = {
+        "lr": lr_model,
+        "gb": gb_model,
+    }
     ml_last_train = time.time()
-    logging.info(f"[ML] Model trained on {instr} ({len(X)} samples)")
-    return model
+    logging.info(f"[ML] Ensemble trained on {instr} ({len(X)} samples, {len(ML_FEATURE_NAMES)} features)")
+    return ml_model
 
 def predict_pwin(instr):
     """Predicts probability of next-candle win using ML model."""
@@ -3210,7 +3241,14 @@ def predict_pwin(instr):
     X, _ = extract_features(df.tail(30))
     if len(X) == 0:
         return None
-    p = ml_model.predict_proba(X[-1].reshape(1, -1))[0][1]
+    x_last = X[-1].reshape(1, -1)
+
+    if isinstance(ml_model, dict):
+        p_lr = float(ml_model["lr"].predict_proba(x_last)[0][1])
+        p_gb = float(np.clip(ml_model["gb"].predict(x_last)[0], 0.0, 1.0))
+        return 0.6 * p_lr + 0.4 * p_gb
+
+    p = ml_model.predict_proba(x_last)[0][1]
     return float(p)
 
 def dynamic_position_size(score, volatility, base_risk):
