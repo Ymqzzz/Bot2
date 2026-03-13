@@ -55,7 +55,7 @@ else:
         "GBP_JPY","GBP_CHF","GBP_AUD","GBP_CAD",
         "AUD_JPY","AUD_CHF","AUD_CAD","CAD_JPY",
         "NZD_JPY","NZD_CHF"
-    ][:25]  # keep top 25
+    ]  # expanded default universe for broader signal ingestion
 
 GRANULARITY  = os.environ.get("GRANULARITY", "M5")
 COOLDOWN_SEC = int(os.environ.get("COOLDOWN_SEC", "5"))
