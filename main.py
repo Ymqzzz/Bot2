@@ -3924,21 +3924,58 @@ async def trade_once(instr, director_item=None, world_state=None):
 
 def generate_eod_payload():
     strat_rows = {}
+    aggregate_r = []
     for k, v in strategy_stats.items():
         n = int(v.get("n", 0))
         wins = int(v.get("wins", 0))
+        last_r = [float(x) for x in list(v.get("last50", []))]
+        aggregate_r.extend(last_r)
+        avg_r = float(v.get("sum_r", 0.0) / max(1, n))
+        r_std = float(np.std(last_r)) if len(last_r) >= 2 else 0.0
+        profit_factor = 9.99
+        pos_sum = sum(x for x in last_r if x > 0)
+        neg_sum = abs(sum(x for x in last_r if x < 0))
+        if neg_sum > 0:
+            profit_factor = float(pos_sum / neg_sum)
         strat_rows[k] = {
             "trades": n,
             "win_rate": (wins / max(1, n)),
-            "expectancy_r": float(v.get("sum_r", 0.0) / max(1, n)),
+            "expectancy_r": avg_r,
+            "stddev_r": r_std,
+            "profit_factor": profit_factor,
+            "sample_size": len(last_r),
         }
     skipped = []
     for e in list(get_log(400)):
         if e.get("kind") == "DECISION" and str(e.get("msg", "")).startswith("Skip"):
             skipped.append(e.get("msg"))
+
+    total_closed = int(daily_trade_budget.get("trades_closed_today", 0))
+    wins = sum(1 for r in aggregate_r if r > 0)
+    losses = sum(1 for r in aggregate_r if r < 0)
+    avg_r_all = float(np.mean(aggregate_r)) if aggregate_r else 0.0
+    median_r_all = float(np.median(aggregate_r)) if aggregate_r else 0.0
+    std_r_all = float(np.std(aggregate_r)) if len(aggregate_r) >= 2 else 0.0
+    confidence_95 = 0.0
+    if aggregate_r:
+        confidence_95 = 1.96 * (std_r_all / math.sqrt(max(1, len(aggregate_r))))
+
     return {
         "trades_opened_today": int(daily_trade_budget.get("trades_opened_today", 0)),
-        "trades_closed_today": int(daily_trade_budget.get("trades_closed_today", 0)),
+        "trades_closed_today": total_closed,
+        "win_loss": {
+            "wins": wins,
+            "losses": losses,
+            "breakeven": max(0, total_closed - wins - losses),
+            "win_rate": (wins / max(1, total_closed)),
+        },
+        "r_multiple_distribution": {
+            "mean": avg_r_all,
+            "median": median_r_all,
+            "stddev": std_r_all,
+            "mean_95ci": [avg_r_all - confidence_95, avg_r_all + confidence_95],
+            "sample_size": len(aggregate_r),
+        },
         "strategy_summary": strat_rows,
         "slippage_spread": {ins: execution_stats.summary(ins) for ins in INSTRUMENTS[:10]},
         "top_skip_reasons": skipped[:5],
