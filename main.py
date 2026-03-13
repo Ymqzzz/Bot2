@@ -1444,6 +1444,42 @@ def exp3_update(instr, rewards):
         est = r/p
         W[a] *= math.exp(exp3_gamma*est/len(W))
 
+def carry_signal(instr: str) -> float:
+    """Interest-rate differential proxy mapped to [-1, 1]."""
+    try:
+        base, quote = instr.split("_")
+    except ValueError:
+        return 0.0
+    rd = float(RF.get(base, 0.0)) - float(RF.get(quote, 0.0))
+    return float(np.tanh(rd * 20.0))
+
+def value_signal(instr: str, df: pd.DataFrame) -> float:
+    """Simple PPP-style value concept: distance from 200-bar fair value."""
+    if df is None or len(df) < 220:
+        return 0.0
+    fair = float(df["c"].rolling(200).mean().iloc[-1])
+    atrv = float(atr(df, ATR_PERIOD).iloc[-1])
+    if not np.isfinite(fair) or not np.isfinite(atrv) or atrv <= 0:
+        return 0.0
+    mispricing = (fair - float(df["c"].iloc[-1])) / atrv
+    return float(np.tanh(mispricing / 2.0))
+
+def macro_dollar_signal(instr: str) -> float:
+    """Directional USD regime tilt from DXY proxy."""
+    macro = fetch_macro_context() or {}
+    bias = (macro.get("DXY_proxy") or {}).get("bias", "unavailable")
+    if bias == "strong":
+        dxy_score = 1.0
+    elif bias == "moderate":
+        dxy_score = 0.35
+    elif bias == "weak":
+        dxy_score = -0.7
+    else:
+        return 0.0
+    if "USD" not in instr:
+        return 0.0
+    return float(-dxy_score if instr.startswith("USD_") else dxy_score)
+
 def ensemble_score(instr, df, sigs, diag):
     """
     Enhanced ensemble:
@@ -1452,6 +1488,7 @@ def ensemble_score(instr, df, sigs, diag):
       - Fibonacci confluence (from fib_signals)
       - Liquidity factor (tight spreads, fresh ticks)
       - Higher timeframe alignment (H1/H4/D1 EMA 12/26)
+      - Carry/value/macro overlays
     Returns: score ∈ [-1..1], regime, weights, pwin
     """
     # EXP3 arm mix (add 'fib' arm)
@@ -1476,6 +1513,11 @@ def ensemble_score(instr, df, sigs, diag):
     liq = liquidity_factor(instr)                            # 0..1
     htf = higher_tf_alignment(instr)                         # -1..+1
 
+    # Additional finance concepts
+    carry_sig = carry_signal(instr)                          # -1..+1
+    value_sig = value_signal(instr, df)                      # -1..+1
+    macro_sig = macro_dollar_signal(instr)                   # -1..+1
+
     # Base blend
     base = (
         weights["trend"]   * float(sigs.get("trend", 0.0)) +
@@ -1484,7 +1526,10 @@ def ensemble_score(instr, df, sigs, diag):
         0.15               * float(sigs.get("pos_skew", 0.0)) +
         0.35               * float(ml_signal) +
         0.20               * float(sigs.get("lux_draw", 0.0)) +
-        weights["fib"]     * float(fib_sig) * float(fib_conf)
+        weights["fib"]     * float(fib_sig) * float(fib_conf) +
+        0.12               * float(carry_sig) +
+        0.10               * float(value_sig) +
+        0.08               * float(macro_sig)
     )
 
 
@@ -1508,6 +1553,9 @@ def ensemble_score(instr, df, sigs, diag):
     sigs["fib_signal"]     = round(fib_sig, 3)
     sigs["liquidity"]      = round(liq, 3)
     sigs["htf_align"]      = round(htf, 3)
+    sigs["carry"]          = round(carry_sig, 3)
+    sigs["value"]          = round(value_sig, 3)
+    sigs["macro_usd"]      = round(macro_sig, 3)
 
     return float(score), regime, weights, float(pwin)
 
