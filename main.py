@@ -2559,7 +2559,7 @@ def build_market_snapshot(instr):
     mode = classify_regime_mode(reg_intraday, reg_intraday, atr_val, mid)
     spr_block, spr_info = spread_liquidity_guard(instr)
     liq = liquidity_factor(instr)
-    return {
+    snapshot = {
         "instrument": instr,
         "mid": mid,
         "spread": float(spread_cache.get(instr, 0.0) or 0.0),
@@ -2580,20 +2580,159 @@ def build_market_snapshot(instr):
         "liq_factor": float(liq),
         "event_block": bool(event_guardrails(instr) or event_guardrails_strict(instr)),
         "mtf_votes": mtf_direction_vote(instr)[0],
+        "spread_shock": bool(float(spr_info.get("percentile", 50.0)) >= 98.0),
+        "profile": {
+            "value_low": float(ema20 - 1.0 * atr_val),
+            "value_high": float(ema20 + 1.0 * atr_val),
+            "acceptance": float(np.clip(0.75 - 0.35 * min(1.0, abs(z) / 3.0), 0.05, 0.95)),
+        },
+        "cross_asset": {
+            "alignment": float(np.clip(np.sign(m15["c"].iloc[-1] - m15["c"].iloc[-8]) * np.sign(h1["c"].iloc[-1] - h1["c"].iloc[-6]), -1.0, 1.0)),
+        },
+        "order_book": {
+            "bids": float(max(1e-6, liq * (1.0 + max(0.0, brk_dir) * min(1.0, brk_mag)))),
+            "asks": float(max(1e-6, liq * (1.0 + max(0.0, -brk_dir) * min(1.0, brk_mag)))),
+        },
+        "pos_book": {
+            "gamma_imbalance": float(np.clip(float(lux.get("lux_draw", 0.0) or 0.0), -1.0, 1.0)),
+        },
         "created_ts": time.time(),
+    }
+    snapshot["families"] = _derive_snapshot_families(snapshot)
+    return snapshot
+
+
+def _derive_snapshot_families(snapshot):
+    m5 = snapshot["dfs"]["M5"]
+    m15 = snapshot["dfs"].get("M15")
+    h1 = snapshot["dfs"].get("H1")
+    c = m5["c"]
+
+    r1 = float(c.iloc[-1] - c.iloc[-2]) if len(c) > 2 else 0.0
+    r5 = float(c.iloc[-1] - c.iloc[-6]) if len(c) > 6 else r1
+    atr = max(float(snapshot.get("atr", 0.0)), 1e-9)
+    velocity = float(np.clip((0.6 * r1 + 0.4 * r5) / atr, -2.0, 2.0))
+
+    ob = snapshot.get("order_book") or {}
+    bids = float(ob.get("bids", 0.0) or 0.0)
+    asks = float(ob.get("asks", 0.0) or 0.0)
+    depth_pressure = float(np.clip((bids - asks) / max(bids + asks, 1e-6), -1.0, 1.0))
+
+    upper = float(c.rolling(20).max().iloc[-2]) if len(c) > 21 else float(c.max())
+    lower = float(c.rolling(20).min().iloc[-2]) if len(c) > 21 else float(c.min())
+    pin_state = "upper" if snapshot["mid"] > upper else "lower" if snapshot["mid"] < lower else "inside"
+
+    spread_info = snapshot.get("spread_info", {})
+    spread_pct = float(spread_info.get("percentile", 50.0))
+    spread_dislocation = bool(spread_pct > 95 or snapshot.get("spread_shock", False))
+
+    pos_book = snapshot.get("pos_book") or {}
+    gamma_imb = float(pos_book.get("gamma_imbalance", 0.0) or 0.0)
+    breakout_mag = abs(float(snapshot.get("breakout", {}).get("mag", 0.0)))
+    gamma_conflict = float(np.clip(abs(gamma_imb) * breakout_mag, 0.0, 1.0))
+
+    profile_ctx = snapshot.get("profile") or {}
+    value_low = profile_ctx.get("value_low", snapshot["ema20"] - atr)
+    value_high = profile_ctx.get("value_high", snapshot["ema20"] + atr)
+    in_value = value_low <= snapshot["mid"] <= value_high
+    acceptance = float(profile_ctx.get("acceptance", 0.65 if in_value else 0.2))
+
+    htf_align = float(snapshot.get("htf_align", 0.0))
+    if not htf_align and m15 is not None and h1 is not None and len(m15) > 40 and len(h1) > 40:
+        m15_fast, m15_slow = float(ema(m15["c"], 10).iloc[-1]), float(ema(m15["c"], 30).iloc[-1])
+        h1_fast, h1_slow = float(ema(h1["c"], 10).iloc[-1]), float(ema(h1["c"], 30).iloc[-1])
+        htf_align = float(np.clip(np.sign(m15_fast - m15_slow) * np.sign(h1_fast - h1_slow), -1.0, 1.0))
+
+    cross = snapshot.get("cross_asset") or {}
+    cross_alignment = float(cross.get("alignment", 0.0) or 0.0)
+
+    wick_ratio = float(snapshot.get("wick_rejection", 0.0) or 0.0)
+    if not wick_ratio and len(m5) > 2:
+        last = m5.iloc[-1]
+        rng = max(float(last["h"] - last["l"]), 1e-9)
+        body = abs(float(last["c"] - last["o"]))
+        wick_ratio = float(np.clip((rng - body) / rng, 0.0, 1.0))
+
+    reclaim = bool(snapshot.get("reclaim", False))
+    if not reclaim:
+        reclaim = bool(abs(snapshot["mid"] - snapshot.get("ema20", snapshot["mid"])) <= 0.35 * atr)
+
+    failed_breakout = bool(snapshot.get("failed_breakout", False))
+    if not failed_breakout:
+        bdir = int(snapshot.get("breakout", {}).get("dir", 0))
+        failed_breakout = bool(bdir != 0 and np.sign(velocity) == -np.sign(bdir))
+
+    liquidity_event_risk = float(np.clip(abs(float(snapshot.get("lux", {}).get("lux_draw", 0.0) or 0.0)), 0.0, 1.0))
+
+    return {
+        "velocity": velocity,
+        "depth_pressure": depth_pressure,
+        "pin_state": pin_state,
+        "spread_dislocation": spread_dislocation,
+        "gamma_conflict": gamma_conflict,
+        "profile_acceptance": acceptance,
+        "in_value": bool(in_value),
+        "htf_alignment": htf_align,
+        "cross_asset_alignment": cross_alignment,
+        "wick_rejection": wick_ratio,
+        "reclaim": reclaim,
+        "failed_breakout": failed_breakout,
+        "liquidity_event_risk": liquidity_event_risk,
+    }
+
+
+def _intelligence_rank(plan, snapshot):
+    fam = snapshot.get("families", {})
+    breakout_mag = abs(float(snapshot.get("breakout", {}).get("mag", 0.0)))
+    entry_precision = float(np.clip(plan.get("rr", 1.0) / 3.0, 0.0, 1.0))
+    execution_feasibility = float(np.clip(0.45 * snapshot.get("liq_factor", 0.0) + 0.35 * (1.0 - min(1.0, snapshot.get("spread_info", {}).get("percentile", 50.0) / 100.0)) + 0.20 * (1.0 - abs(fam.get("depth_pressure", 0.0))), 0.0, 1.0))
+    profile_alignment = float(np.clip(0.5 * fam.get("profile_acceptance", 0.5) + 0.5 * (1.0 if fam.get("in_value", False) else 0.0), 0.0, 1.0))
+    gamma_conflict = float(np.clip(fam.get("gamma_conflict", 0.0), 0.0, 1.0))
+    cross_alignment = float(np.clip((fam.get("cross_asset_alignment", 0.0) + 1.0) / 2.0, 0.0, 1.0))
+    liquidity_event_risk = float(np.clip(fam.get("liquidity_event_risk", 0.0), 0.0, 1.0))
+
+    intelligence = (
+        0.20 * entry_precision
+        + 0.22 * execution_feasibility
+        + 0.17 * profile_alignment
+        + 0.14 * cross_alignment
+        + 0.12 * min(1.0, breakout_mag)
+        - 0.09 * liquidity_event_risk
+        - 0.10 * gamma_conflict
+    )
+    legacy = float(plan["ev_r"] * plan["confidence"] * snapshot["liq_factor"])
+    legacy_norm = float(np.clip(legacy / 1.5, 0.0, 1.0))
+    blended = 0.62 * legacy_norm + 0.38 * float(np.clip(intelligence, 0.0, 1.0))
+    return float(max(1e-6, blended)), {
+        "entry_precision": entry_precision,
+        "execution_feasibility": execution_feasibility,
+        "liquidity_event_risk": liquidity_event_risk,
+        "profile_alignment": profile_alignment,
+        "gamma_conflict": gamma_conflict,
+        "cross_asset_alignment": cross_alignment,
+        "legacy_norm": legacy_norm,
+        "intelligence": float(np.clip(intelligence, 0.0, 1.0)),
     }
 
 
 def strategy_trend_pullback(snapshot):
+    fam = snapshot.get("families", {})
     m5, m15, h1 = snapshot["dfs"]["M5"], snapshot["dfs"]["M15"], snapshot["dfs"]["H1"]
     e15f, e15s = ema(m15["c"], 10).iloc[-1], ema(m15["c"], 30).iloc[-1]
     eh1f, eh1s = ema(h1["c"], 10).iloc[-1], ema(h1["c"], 30).iloc[-1]
     trend_dir = 1 if (e15f > e15s and eh1f > eh1s) else -1 if (e15f < e15s and eh1f < eh1s) else 0
     if trend_dir == 0 or snapshot["event_block"] or snapshot["spread_block"]:
         return None
+    if fam.get("htf_alignment", 0.0) < 0.5:
+        return None
+    if fam.get("cross_asset_alignment", 0.0) < -0.2:
+        return None
     pullback_zone = ema(m5["c"], 20).iloc[-1] if trend_dir > 0 else ema(m5["c"], 20).iloc[-1]
+    value_low = snapshot.get("profile", {}).get("value_low", snapshot["ema20"] - snapshot["atr"])
+    value_high = snapshot.get("profile", {}).get("value_high", snapshot["ema20"] + snapshot["atr"])
+    profile_pullback = value_low <= pullback_zone <= value_high
     near_pullback = abs(snapshot["mid"] - pullback_zone) <= 0.8 * snapshot["atr"]
-    if not near_pullback:
+    if not near_pullback or not profile_pullback:
         return None
     entry = float(pullback_zone)
     sl = entry - 1.6 * snapshot["atr"] if trend_dir > 0 else entry + 1.6 * snapshot["atr"]
@@ -2601,14 +2740,21 @@ def strategy_trend_pullback(snapshot):
     confidence = min(1.0, 0.55 + 0.25 * snapshot["liq_factor"])
     pwin = min(0.85, 0.50 + 0.20 * confidence)
     evr = pwin * 2.0 - (1 - pwin)
-    return make_trade_plan(snapshot["instrument"], "Trend-Pullback", "BUY" if trend_dir > 0 else "SELL", "LIMIT" if near_pullback else "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"trend_dir": trend_dir})
+    return make_trade_plan(snapshot["instrument"], "Trend-Pullback", "BUY" if trend_dir > 0 else "SELL", "LIMIT" if near_pullback else "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"trend_dir": trend_dir, "htf_alignment": fam.get("htf_alignment", 0.0), "cross_asset_alignment": fam.get("cross_asset_alignment", 0.0), "profile_pullback": True})
 
 
 def strategy_squeeze_breakout(snapshot):
     brk = snapshot["breakout"]
+    fam = snapshot.get("families", {})
     if snapshot["event_block"] or snapshot["spread_block"]:
         return None
     if snapshot["compression"] < 0.70 or abs(brk["dir"]) == 0 or brk["mag"] < 0.2:
+        return None
+    if abs(fam.get("depth_pressure", 0.0)) < 0.25:
+        return None
+    if fam.get("pin_state") == "inside":
+        return None
+    if fam.get("spread_dislocation", False):
         return None
     h1 = snapshot["mtf_votes"].get("H1", 0)
     if h1 == -brk["dir"]:
@@ -2619,13 +2765,22 @@ def strategy_squeeze_breakout(snapshot):
     confidence = min(1.0, 0.45 + 0.35 * snapshot["compression"] + 0.2 * min(1.0, brk["mag"]))
     pwin = min(0.75, 0.45 + 0.15 * confidence)
     evr = pwin * 2.5 - (1 - pwin)
-    return make_trade_plan(snapshot["instrument"], "Squeeze-Breakout", "BUY" if brk["dir"] > 0 else "SELL", "STOP", entry, sl, tp, max(6, TIME_STOP_BARS // 2), confidence, pwin, evr, COOLDOWN_SEC * 2, {"compression": snapshot["compression"], "brk_mag": brk["mag"]})
+    return make_trade_plan(snapshot["instrument"], "Squeeze-Breakout", "BUY" if brk["dir"] > 0 else "SELL", "STOP", entry, sl, tp, max(6, TIME_STOP_BARS // 2), confidence, pwin, evr, COOLDOWN_SEC * 2, {"compression": snapshot["compression"], "brk_mag": brk["mag"], "execution_feasibility": 1.0 - abs(fam.get("depth_pressure", 0.0)), "spread_pctile": snapshot.get("spread_info", {}).get("percentile", 50.0), "reason_codes": ["depth_pressure_ok", "pin_state_ok", "spread_dislocation_clear"]})
 
 
 def strategy_range_mean_reversion(snapshot):
+    fam = snapshot.get("families", {})
     if snapshot["mode"] not in ("range", "low_vol"):
         return None
     if snapshot["event_block"] or snapshot["spread_block"]:
+        return None
+    if fam.get("gamma_conflict", 0.0) > 0.55:
+        return None
+    if abs(fam.get("velocity", 0.0)) > 0.85:
+        return None
+    if fam.get("cross_asset_alignment", 0.0) < -0.35:
+        return None
+    if not fam.get("in_value", False):
         return None
     z = snapshot["zscore"]
     if abs(z) < 1.3:
@@ -2638,14 +2793,19 @@ def strategy_range_mean_reversion(snapshot):
     pwin = min(0.82, 0.52 + 0.18 * confidence)
     rr = abs(tp - entry) / max(abs(entry - sl), 1e-9)
     evr = pwin * rr - (1 - pwin)
-    return make_trade_plan(snapshot["instrument"], "Range-MeanReversion", "BUY" if side > 0 else "SELL", "LIMIT", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"zscore": z})
+    return make_trade_plan(snapshot["instrument"], "Range-MeanReversion", "BUY" if side > 0 else "SELL", "LIMIT", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"zscore": z, "gamma_conflict": fam.get("gamma_conflict", 0.0), "cross_asset_alignment": fam.get("cross_asset_alignment", 0.0), "profile_acceptance": fam.get("profile_acceptance", 0.5)})
 
 
 def strategy_liquidity_sweep(snapshot):
+    fam = snapshot.get("families", {})
     if snapshot["mode"] not in ("range", "neutral"):
         return None
     draw = float(snapshot["lux"].get("lux_draw", 0.0) or 0.0)
     if abs(draw) < 0.35 or snapshot["event_block"]:
+        return None
+    if not (fam.get("reclaim", False) or fam.get("wick_rejection", 0.0) >= 0.45 or fam.get("failed_breakout", False)):
+        return None
+    if fam.get("liquidity_event_risk", 1.0) > 0.85:
         return None
     side = 1 if draw < 0 else -1
     entry = snapshot["mid"]
@@ -2654,7 +2814,7 @@ def strategy_liquidity_sweep(snapshot):
     confidence = min(1.0, 0.45 + 0.4 * abs(draw))
     pwin = min(0.78, 0.48 + 0.2 * confidence)
     evr = pwin * 1.8 - (1 - pwin)
-    return make_trade_plan(snapshot["instrument"], "Liquidity-Sweep-Reversal", "BUY" if side > 0 else "SELL", "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"lux_draw": draw})
+    return make_trade_plan(snapshot["instrument"], "Liquidity-Sweep-Reversal", "BUY" if side > 0 else "SELL", "MARKET", entry, sl, tp, TIME_STOP_BARS, confidence, pwin, evr, COOLDOWN_SEC * 2, {"lux_draw": draw, "reclaim": fam.get("reclaim", False), "wick_rejection": fam.get("wick_rejection", 0.0), "failed_breakout": fam.get("failed_breakout", False), "liquidity_event_risk": fam.get("liquidity_event_risk", 0.0)})
 
 
 def candidate_plans_from_snapshot(snapshot, allowed_impl=None):
@@ -2706,7 +2866,9 @@ def strategy_router(instr, snapshot, allowed_impl=None):
         debug.append({"strategy": p["strategy"], "ev_r": p["ev_r"], "rr": p["rr"], "confidence": p["confidence"], "gate": reason})
         if ok and strategy_enabled(p["strategy"]):
             mismatch_penalty = 0.9 if (snapshot["mode"] == "trend" and "Range" in p["strategy"]) else 1.0
-            p["rank"] = p["ev_r"] * p["confidence"] * snapshot["liq_factor"] * mismatch_penalty
+            rank_score, rank_components = _intelligence_rank(p, snapshot)
+            p["rank"] = rank_score * mismatch_penalty
+            p.setdefault("meta", {}).update(rank_components)
             survivors.append(p)
     chosen = max(survivors, key=lambda x: x["rank"]) if survivors else None
     log_event("DECISION", instr, "Plan candidates", {"regime": snapshot["regime"], "plans": debug, "chosen": (chosen or {}).get("strategy")}, level=2)
@@ -2808,7 +2970,17 @@ def execute_trade_plan(plan, snapshot):
 
     pctl_block, pctl_info = spread_percentile_guard(plan["instrument"])
     spread_pctile = float(pctl_info.get("percentile", 50.0))
-    order_type = choose_entry_type(plan.get("strategy", ""), float(snapshot.get("breakout", {}).get("mag", 0.0)), float(snapshot.get("liq_factor", 0.0)), spread_pctile)
+    fam = snapshot.get("families", {})
+    order_type = choose_entry_type(
+        plan.get("strategy", ""),
+        float(snapshot.get("breakout", {}).get("mag", 0.0)),
+        float(snapshot.get("liq_factor", 0.0)),
+        spread_pctile,
+        velocity=float(fam.get("velocity", 0.0)),
+        depth_pressure=float(fam.get("depth_pressure", 0.0)),
+        profile_acceptance=float(fam.get("profile_acceptance", 0.5)),
+        spread_shock=bool(snapshot.get("spread_shock", False) or fam.get("spread_dislocation", False)),
+    )
     if plan["order_type"] == "STOP":
         order_type = "STOP"
     if pctl_block and order_type == "MARKET":
@@ -3404,7 +3576,7 @@ def choose_order_for_breakout(instr:str, df:pd.DataFrame, score:float):
     if score*dirn <= 0:
         use_stop = False
         level = None
-    return {
+    snapshot = {
         "use_stop": bool(use_stop and level is not None),
         "stop_price": float(level) if (use_stop and level is not None) else None,
         "dir": int(dirn),
