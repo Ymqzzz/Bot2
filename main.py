@@ -33,6 +33,10 @@ from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
 
+from control_plane.config import ControlPlaneConfig
+from control_plane.models import AllocationCandidate
+from control_plane.pipeline import ControlPlanePipeline
+
 
 # ========= CONFIG =========
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
@@ -289,6 +293,10 @@ daily_trade_budget = {
     "consecutive_losses": 0,
 }
 bandit_state = defaultdict(lambda: defaultdict(lambda: {"alpha": 1.0, "beta": 1.0}))
+
+control_plane_config = ControlPlaneConfig()
+control_plane_pipeline = ControlPlanePipeline(config=control_plane_config, calendar_provider=lambda: fetch_econ_calendar() or []) if control_plane_config.CONTROL_PLANE_ENABLED else None
+last_control_plane_snapshot = None
 
 # Analysis / Ops log
 from threading import Lock
@@ -2697,6 +2705,62 @@ def plan_passes_gates(plan, snapshot):
     return True, "OK"
 
 
+def control_plane_select_plan(instr, snapshot, allowed_impl=None):
+    plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
+    if not plans or control_plane_pipeline is None:
+        return None, [], None
+    open_positions = get_positions_info() or []
+    candidates = []
+    for i, p in enumerate(plans):
+        side = p.get("side", "BUY")
+        candidates.append(AllocationCandidate(
+            candidate_id=f"{instr}-{i}-{p.get('strategy','na')}",
+            instrument=instr,
+            strategy_name=p.get("strategy", ""),
+            side=side,
+            setup_type=p.get("strategy", ""),
+            expected_value=float(p.get("ev_r", 0.0)),
+            confidence=float(p.get("confidence", 0.0)),
+            risk_fraction_requested=float(p.get("risk_fraction", ACCOUNT_RISK_PCT)),
+            risk_fraction_capped=None,
+            regime_score=0.5,
+            event_score=0.5,
+            execution_score=0.5,
+            edge_score=float(p.get("confidence", 0.0)),
+            portfolio_fit_score=0.5,
+            macro_cluster_key="anti_usd" if "USD" in instr and side == "BUY" else "pro_usd" if "USD" in instr else "other",
+            currency_exposure_map={},
+            correlation_bucket=None,
+            priority_score=None,
+            blocked=False,
+            block_reason_codes=[],
+        ))
+    bars = {instr: get_candles(instr, count=120)}
+    cp = control_plane_pipeline.run_cycle(
+        instrument_snapshots={instr: {"event_risk": 1.0 if snapshot.get("event_block") else 0.0, "spread_bps": float(snapshot.get("spread", 0.0)) * 10000}},
+        bars=bars,
+        candidate_pool=candidates,
+        open_positions=open_positions,
+        edge_context={},
+    )
+    approved = set(cp.allocation_decision.approved_candidate_ids if cp.allocation_decision else [])
+    for c in candidates:
+        if c.candidate_id in approved:
+            for p in plans:
+                if p.get("strategy") == c.strategy_name:
+                    exec_dec = cp.execution_decisions.get(c.candidate_id)
+                    tactic = exec_dec.recommended_tactic if exec_dec else None
+                    if tactic == "passive_limit":
+                        p["order_type"] = "LIMIT"
+                    elif tactic == "stop_entry":
+                        p["order_type"] = "STOP"
+                    elif tactic == "market_immediate":
+                        p["order_type"] = "MARKET"
+                    p["control_plane"] = {"candidate_id": c.candidate_id, "recommended_tactic": tactic, "execution_allow": bool(exec_dec.allow_entry) if exec_dec else True}
+                    return p, plans, cp
+    return None, plans, cp
+
+
 def strategy_router(instr, snapshot, allowed_impl=None):
     plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
     debug = []
@@ -3959,10 +4023,15 @@ async def trade_once(instr, director_item=None, world_state=None):
             log_event("RISK", instr, "Daily kill switch active", kill_diag, level=1)
             return
 
+        global last_control_plane_snapshot
         allowed_codes = (director_item or {}).get("strategies") or list(STRATEGY_CATALOG.keys())
         allowed_impl = [strategy_code_to_impl(c) for c in allowed_codes]
-        plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
-        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": candidates, "selected": plan})
+        plan, candidates, cp_snapshot = control_plane_select_plan(instr, snapshot, allowed_impl=allowed_impl)
+        if plan is None:
+            plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
+        else:
+            last_control_plane_snapshot = cp_snapshot.to_flat_dict() if cp_snapshot else None
+        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": candidates, "selected": plan, "control_plane": (cp_snapshot.to_flat_dict() if cp_snapshot else None)})
 
         if not plan:
             daily_trade_budget["missed_trades"] = daily_trade_budget.get("missed_trades", 0) + 1
