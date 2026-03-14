@@ -32,3 +32,14 @@ def test_replay_runs_and_counts_decisions():
 
     assert out.cycles == 3
     assert out.approved >= 1
+
+
+def test_replay_emits_rate_and_reason_map():
+    bot = UpgradedBot()
+    market = DummyMarketData()
+    ctx = BrokerContext(nav=100_000.0, open_positions=[], corr_matrix={})
+
+    out = ReplayEngine().run(bot, market, ctx, cycles=2)
+
+    assert 0.0 <= out.approval_rate <= 1.0
+    assert isinstance(out.block_reasons, dict)

@@ -905,3 +905,31 @@ To include all concept families without destabilizing the bot:
 5. **Production layer:** scaled only after sustained pass windows.
 
 This is how you can realistically absorb a very broad quant toolkit while protecting capital and system integrity.
+
+## 12) Accuracy/efficiency/foolproofness upgrades for the new modules
+
+### Policy engine hardening
+
+- Move from static thresholds to **adaptive limits** tied to spread stress.
+- Add explicit event-aware spread cap (`event_spread_policy_block`) so event windows are blocked for the *right* reason.
+- Enforce numeric clamping/sanitization before policy math to avoid malformed data creating false approvals.
+
+### Tail-risk realism
+
+- Use **log returns** rather than arithmetic returns for better aggregation consistency under larger moves.
+- Compute VaR via interpolated empirical quantiles and ES via explicit tail bucket sizing.
+- Improve dislocation by combining volatility, jump-over-median ratio, and short-horizon drift anomaly.
+
+### Replay-engine actionability
+
+- Replay output should include `approval_rate` and reason-frequency histograms (`block_reasons`) to detect over-filtering.
+- Promote replay result objects to first-class report artifacts for threshold tuning and regression gates.
+
+### Edge-health nuance
+
+- Blend deterministic checks with lightweight Bayesian diagnostics:
+  - beta-binomial posterior win-rate mean,
+  - approximate probability of positive expectancy.
+- Decay should trigger on either sustained mechanical weakness *or* posterior confidence collapse.
+- Keep probation/recovery states for strategies that improve after disablement.
+

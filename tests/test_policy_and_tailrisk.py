@@ -28,4 +28,4 @@ def test_dislocation_and_policy_block():
     ok, reason = policy_check(spread_pctile=95.0, dislocation=d, near_event=True, max_spread_pctile=85.0)
     assert d > 1.0
     assert not ok
-    assert reason in {"spread_policy_block", "dislocation_policy_block", "event_dislocation_block"}
+    assert reason in {"spread_policy_block", "dislocation_policy_block", "event_dislocation_block", "event_spread_policy_block"}

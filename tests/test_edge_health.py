@@ -11,6 +11,8 @@ def test_metrics_include_recent_and_drawdown_fields():
     assert "expectancy_recent" in m
     assert "win_rate_recent" in m
     assert "max_drawdown" in m
+    assert "prob_positive_expectancy" in m
+    assert "win_rate_posterior_mean" in m
 
 
 def test_edge_decay_detects_recent_breakdown_after_enough_trades():
