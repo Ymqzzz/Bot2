@@ -8,6 +8,8 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import requests
 import pandas as pd
@@ -136,6 +138,7 @@ OPENROUTER_TIMEOUT_SEC = int(os.environ.get("OPENROUTER_TIMEOUT_SEC", "12"))
 OPENROUTER_COOLDOWN_SEC = int(os.environ.get("OPENROUTER_COOLDOWN_SEC", "120"))
 OPENROUTER_SITE_URL = os.environ.get("OPENROUTER_SITE_URL", "")
 OPENROUTER_APP_NAME = os.environ.get("OPENROUTER_APP_NAME", "")
+MARKET_INTEL_ENABLED = os.environ.get("MARKET_INTEL_ENABLED", "1").strip().lower() not in {"0", "false", "off", "no"}
 
 
 # Optional external keys
@@ -304,6 +307,123 @@ sent_cache  = {"ts": 0, "data": {}}
 corr_cache  = {"ts": 0, "data": {}}
 context_blob = {}
 orderflow_cache = {}
+
+
+@dataclass
+class MarketIntelSnapshot:
+    instrument: str
+    asof: datetime
+    enabled: bool = True
+    degraded: bool = False
+    provider_status: Dict[str, str] = field(default_factory=dict)
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    runtime_context: Dict[str, Any] = field(default_factory=dict)
+    features: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def disabled(cls, instrument: str, asof: datetime, runtime_context: Optional[Dict[str, Any]] = None):
+        return cls(
+            instrument=instrument,
+            asof=asof,
+            enabled=False,
+            degraded=False,
+            provider_status={"pipeline": "disabled"},
+            events=[{"kind": "pipeline_disabled", "message": "market_intel_disabled"}],
+            runtime_context=runtime_context or {},
+            features={},
+        )
+
+    def to_dict(self):
+        return {
+            "instrument": self.instrument,
+            "asof": self.asof.isoformat(),
+            "enabled": self.enabled,
+            "degraded": self.degraded,
+            "provider_status": dict(self.provider_status),
+            "events": list(self.events),
+            "runtime_context": dict(self.runtime_context),
+            "features": dict(self.features),
+        }
+
+
+class MarketIntelPipeline:
+    def __init__(self, enabled: bool = True):
+        self.enabled = bool(enabled)
+        self._warm_cache: Dict[str, Dict[str, Any]] = {}
+        self.started_at = time.time()
+
+    def warm_buffers(self, instruments: List[str]):
+        if not self.enabled:
+            return
+        for instrument in instruments:
+            try:
+                self.build_snapshot(instrument, asof=datetime.now(timezone.utc), runtime_context={"phase": "warmup"})
+            except Exception as exc:
+                log_event("INFO", instrument, "Market intel warmup failed", {"err": str(exc)}, level=1)
+
+    def build_snapshot(self, instrument: str, asof: Optional[datetime] = None, runtime_context: Optional[Dict[str, Any]] = None):
+        asof = asof or datetime.now(timezone.utc)
+        runtime_context = runtime_context or {}
+        if not self.enabled:
+            return MarketIntelSnapshot.disabled(instrument, asof, runtime_context=runtime_context)
+
+        snap = MarketIntelSnapshot(instrument=instrument, asof=asof, runtime_context=dict(runtime_context))
+        try:
+            macro = fetch_macro_context() or {}
+            snap.features["macro_bias"] = (macro.get("DXY_proxy") or {}).get("bias", "unavailable")
+            snap.provider_status["macro"] = "ok"
+        except Exception as exc:
+            snap.provider_status["macro"] = "degraded"
+            snap.degraded = True
+            snap.events.append({"kind": "provider_degraded", "provider": "macro", "message": str(exc)})
+
+        try:
+            events = fetch_econ_calendar() or []
+            next_event = events[0] if isinstance(events, list) and events else {}
+            snap.features["next_event"] = {
+                "when": next_event.get("when"),
+                "currency": next_event.get("currency"),
+                "event": next_event.get("event"),
+            }
+            snap.provider_status["econ"] = "ok"
+        except Exception as exc:
+            snap.provider_status["econ"] = "degraded"
+            snap.degraded = True
+            snap.events.append({"kind": "provider_degraded", "provider": "econ", "message": str(exc)})
+
+        try:
+            of = orderflow_cache.get(instrument) if isinstance(orderflow_cache, dict) else {}
+            of = of if isinstance(of, dict) else {}
+            snap.features["orderflow"] = {
+                "imbalance": float(of.get("imbalance", 0.0) or 0.0),
+                "source": of.get("source", "cache"),
+            }
+            snap.provider_status["orderflow"] = "ok" if of else "partial"
+            if not of:
+                snap.degraded = True
+                snap.events.append({"kind": "provider_partial", "provider": "orderflow", "message": "orderflow_cache_empty"})
+        except Exception as exc:
+            snap.provider_status["orderflow"] = "degraded"
+            snap.degraded = True
+            snap.events.append({"kind": "provider_degraded", "provider": "orderflow", "message": str(exc)})
+            snap.features["orderflow"] = {"imbalance": 0.0, "source": "degraded"}
+
+        if snap.degraded and not snap.events:
+            snap.events.append({"kind": "degraded", "message": "market_intel_partial"})
+
+        self._warm_cache[instrument] = {"ts": time.time(), "snapshot": snap.to_dict()}
+        return snap
+
+
+market_intel_pipeline: Optional[MarketIntelPipeline] = None
+
+
+def init_market_intel_pipeline():
+    global market_intel_pipeline
+    if market_intel_pipeline is None:
+        market_intel_pipeline = MarketIntelPipeline(enabled=MARKET_INTEL_ENABLED)
+        log_event("INFO", None, "Market intel pipeline initialized", {"enabled": market_intel_pipeline.enabled}, level=1)
+    return market_intel_pipeline
 
 SESSION_WINDOWS = [
     ("ASIA", 19 * 60, 24 * 60),
@@ -3946,9 +4066,32 @@ async def fibplan_cmd(ctx, instrument: str):
 
 async def trade_once(instr, director_item=None, world_state=None):
     try:
+        pipeline = init_market_intel_pipeline()
+        now_utc = datetime.now(timezone.utc)
+        runtime_context = {
+            "director_item": director_item or {},
+            "world_state_session": (world_state or {}).get("session") if isinstance(world_state, dict) else None,
+            "trade_budget_mode": daily_trade_budget.get("mode", "normal"),
+        }
+        market_intel_snapshot = pipeline.build_snapshot(instr, asof=now_utc, runtime_context=runtime_context)
         snapshot = build_market_snapshot(instr)
         if not snapshot:
             return
+
+        snapshot["market_intel"] = market_intel_snapshot.to_dict()
+        if market_intel_snapshot.degraded or not market_intel_snapshot.enabled:
+            log_event(
+                "INFO",
+                instr,
+                "Market intel snapshot status",
+                {
+                    "enabled": market_intel_snapshot.enabled,
+                    "degraded": market_intel_snapshot.degraded,
+                    "provider_status": market_intel_snapshot.provider_status,
+                    "events": market_intel_snapshot.events,
+                },
+                level=2,
+            )
 
         session_info = current_session_info()
         session_name = session_info["session_name"]
@@ -3961,8 +4104,19 @@ async def trade_once(instr, director_item=None, world_state=None):
 
         allowed_codes = (director_item or {}).get("strategies") or list(STRATEGY_CATALOG.keys())
         allowed_impl = [strategy_code_to_impl(c) for c in allowed_codes]
+        decision_context = {
+            "instrument": instr,
+            "now_utc": now_utc.isoformat(),
+            "session": session_name,
+            "director": director_item,
+            "market_intel": market_intel_snapshot.to_dict(),
+        }
+        snapshot["decision_context"] = decision_context
         plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
-        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": candidates, "selected": plan})
+        if plan is not None:
+            plan.setdefault("meta", {})["market_intel"] = market_intel_snapshot.to_dict()
+            plan["meta"]["decision_context"] = decision_context
+        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "decision_context": decision_context, "candidates": candidates, "selected": plan})
 
         if not plan:
             daily_trade_budget["missed_trades"] = daily_trade_budget.get("missed_trades", 0) + 1
@@ -4162,6 +4316,11 @@ async def on_ready():
         get_instruments_meta()
     except Exception:
         pass
+    try:
+        pipeline = init_market_intel_pipeline()
+        pipeline.warm_buffers(INSTRUMENTS)
+    except Exception as exc:
+        logger.warning(f"Market intel startup warmup failed: {exc}")
     bot.loop.create_task(auto_trader())
 
 @bot.command(name="status")
