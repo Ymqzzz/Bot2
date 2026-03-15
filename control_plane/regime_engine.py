@@ -1,161 +1,120 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+
 import pandas as pd
 
-from .config import ControlPlaneConfig
-from .models import EventDecision, RegimeDecision
-from .reason_codes import *
-from .regime_features import extract_regime_features
-from .regime_policies import REGIME_POLICIES
-
-
-class RegimeEngine:
-    def __init__(self, config: ControlPlaneConfig):
-        self.config = config
-
-    def classify_instrument_regime(
-        self,
-        instrument: str,
-        market_intel_snapshot: dict[str, Any] | None,
-        recent_bars: pd.DataFrame | None,
-        event_decision: EventDecision,
-    ) -> RegimeDecision:
-        asof = datetime.now(timezone.utc)
-        f = extract_regime_features(market_intel_snapshot, recent_bars)
-        scores = {
-            "trend_expansion": f["trend_strength_score"] * 0.6 + f["expansion_score"] * 0.4,
-            "rotation_mean_reversion": f["rotation_score"] * 0.6 + f["range_efficiency_score"] * 0.4,
-            "compression_pre_breakout": f["compression_score"] * 0.7 + f["rv_expansion_factor"] * 0.3,
-            "sweep_reversal": f["sweep_tendency_score"] * 0.6 + f["structure_rejection_density"] * 0.4,
-            "event_chaos": max(f["event_chaos_score"], 1.0 if event_decision.event_phase in {"release_window", "headline_risk"} else 0.0),
-            "dead_zone": f["dead_zone_score"],
-        }
-        regime_name, confidence = max(scores.items(), key=lambda kv: (kv[1], kv[0]))
-        reasons: list[str] = []
-        if confidence < self.config.REGIME_MIN_CONFIDENCE:
-            regime_name = "uncertain_mixed"
-            confidence = max(confidence, 0.01)
-            reasons.append(REGIME_UNCERTAIN)
-        if regime_name == "trend_expansion":
-            reasons.extend([REGIME_TREND_EXPANSION, REGIME_BREAKOUT_ALLOWED, REGIME_PULLBACK_ALLOWED, REGIME_MEAN_REVERSION_BLOCKED])
-        elif regime_name == "rotation_mean_reversion":
-            reasons.extend([REGIME_ROTATION, REGIME_MEAN_REVERSION_ALLOWED, REGIME_BREAKOUT_SUPPRESSED])
-        elif regime_name == "compression_pre_breakout":
-            reasons.extend([REGIME_COMPRESSION, REGIME_BREAKOUT_ALLOWED])
-        elif regime_name == "sweep_reversal":
-            reasons.extend([REGIME_SWEEP_REVERSAL, REGIME_MEAN_REVERSION_ALLOWED])
-        elif regime_name == "event_chaos":
-            reasons.append(REGIME_EVENT_CHAOS)
-        elif regime_name == "dead_zone":
-            reasons.append(REGIME_DEAD_ZONE)
-
-        policy = self.get_strategy_policy(RegimeDecision(
-            instrument=instrument, asof=asof, regime_name=regime_name, regime_confidence=confidence,
-            regime_state_label=regime_name, trend_strength_score=f["trend_strength_score"], rotation_score=f["rotation_score"],
-            compression_score=f["compression_score"], expansion_score=f["expansion_score"], event_chaos_score=f["event_chaos_score"],
-            dead_zone_score=f["dead_zone_score"], allowed_strategies=[], suppressed_strategies=[], blocked_strategies=[],
-            strategy_weight_multipliers={}, sizing_cap_multiplier=1.0, order_preference="balanced", exit_posture="balanced", reason_codes=[]
-        ))
-
-        return RegimeDecision(
-            instrument=instrument,
-            asof=asof,
-
 from .config import ControlPlaneConfig, RegimeUncertainBehavior
-from .models import RegimeDecision
-from .reason_codes import *
-from .regime_features import extract_regime_features
-from .regime_policies import REGIME_POLICY_TABLE
+from .models import EventDecision, RegimeDecision
+from .reason_codes import (
+    REGIME_BREAKOUT_ALLOWED,
+    REGIME_BREAKOUT_SUPPRESSED,
+    REGIME_DEAD_ZONE,
+    REGIME_EVENT_CHAOS,
+    REGIME_MEAN_REVERSION_ALLOWED,
+    REGIME_MEAN_REVERSION_BLOCKED,
+    REGIME_PULLBACK_ALLOWED,
+    REGIME_PULLBACK_SUPPRESSED,
+    REGIME_ROTATION,
+    REGIME_TREND_EXPANSION,
+    REGIME_UNCERTAIN,
+)
 
 
 class RegimeEngine:
     def __init__(self, config: ControlPlaneConfig | None = None) -> None:
         self.config = config or ControlPlaneConfig()
 
-    def classify_instrument_regime(self, instrument, market_intel_snapshot, recent_bars, event_decision) -> RegimeDecision:
-        f = extract_regime_features(recent_bars, market_intel_snapshot)
-        scores = {
-            "trend_expansion": 0.45 * f["trend_strength_score"] + 0.35 * f["expansion_score"] + 0.20 * f["intraday_impulse_quality_score"],
-            "rotation_mean_reversion": 0.5 * f["rotation_score"] + 0.25 * f["value_area_rotation_score"] + 0.25 * f["structure_rejection_density"],
-            "compression_pre_breakout": 0.60 * f["compression_score"] + 0.40 * f["realized_vol_expansion_factor"],
-            "sweep_reversal": 0.65 * f["sweep_tendency_score"] + 0.35 * f["structure_rejection_density"],
-            "event_chaos": max(f["event_chaos_score"], 1.0 if event_decision.event_phase in {"release_window", "headline_risk"} else 0.0),
-            "dead_zone": f["dead_zone_score"],
-        }
-        regime_name = max(scores, key=scores.get)
-        confidence = float(scores[regime_name])
-        if confidence < self.config.REGIME_MIN_CONFIDENCE:
+    def classify_instrument_regime(
+        self,
+        instrument: str,
+        snapshot: dict | None,
+        bars: pd.DataFrame | None,
+        event_decision: EventDecision,
+    ) -> RegimeDecision:
+        snapshot = snapshot or {}
+        bars = bars if bars is not None else pd.DataFrame()
+        asof = datetime.now(timezone.utc)
+
+        close = bars.get("close") if not bars.empty and "close" in bars else pd.Series([1.0, 1.0])
+        trend_strength = float(abs(close.iloc[-1] - close.iloc[max(0, len(close) - 20)]) / max(1e-8, abs(close.iloc[-1])))
+        spread_shock = float(snapshot.get("spread_shock", snapshot.get("spread_dislocation", 0.0)) or 0.0)
+        rotation = float(snapshot.get("rotation", 0.0) or 0.0)
+        compression = float(snapshot.get("compression", 0.0) or 0.0)
+        expansion = float(snapshot.get("velocity", 0.0) or 0.0)
+        event_chaos = max(spread_shock, 1.0 - event_decision.event_risk_multiplier)
+        dead_zone = 1.0 if trend_strength < 0.0005 and expansion < 0.2 else 0.0
+
+        regime_name = "uncertain_mixed"
+        reason_codes = [REGIME_UNCERTAIN]
+        confidence = max(0.0, min(1.0, trend_strength * 20))
+        if trend_strength >= self.config.TREND_STRENGTH_THRESHOLD or expansion >= self.config.EXPANSION_THRESHOLD:
+            regime_name = "trend_expansion"
+            reason_codes = [REGIME_TREND_EXPANSION]
+            confidence = max(confidence, 0.7)
+        elif rotation >= self.config.ROTATION_THRESHOLD:
+            regime_name = "rotation_mean_reversion"
+            reason_codes = [REGIME_ROTATION]
+            confidence = max(confidence, 0.6)
+        elif dead_zone > 0:
+            regime_name = "dead_zone"
+            reason_codes = [REGIME_DEAD_ZONE]
+            confidence = 0.4
+
+        if event_chaos >= self.config.EVENT_CHAOS_THRESHOLD:
             regime_name = "uncertain_mixed"
-        if event_decision.event_state in {"release_active", "headline_risk"}:
-            regime_name = "event_chaos"
-        policy = REGIME_POLICY_TABLE[regime_name]
-        reasons = [
-            REGIME_EVENT_CHAOS if regime_name == "event_chaos" else "",
-            REGIME_DEAD_ZONE if regime_name == "dead_zone" else "",
-            REGIME_UNCERTAIN if regime_name == "uncertain_mixed" else "",
-        ]
-        if "Breakout-Squeeze" in policy["allowed"]:
-            reasons.append(REGIME_BREAKOUT_ALLOWED)
-        if "Range-MeanReversion" in policy["allowed"]:
-            reasons.append(REGIME_MEAN_REVERSION_ALLOWED)
-        elif "Range-MeanReversion" in policy["blocked"]:
-            reasons.append(REGIME_MEAN_REVERSION_BLOCKED)
-        if "Trend-Pullback" in policy["allowed"]:
-            reasons.append(REGIME_PULLBACK_ALLOWED)
-        if "Trend-Pullback" in policy["suppressed"]:
-            reasons.append(REGIME_PULLBACK_SUPPRESSED)
-        if regime_name == "uncertain_mixed" and self.config.REGIME_UNCERTAIN_BEHAVIOR == RegimeUncertainBehavior.block:
-            policy = {**policy, "blocked": ["Breakout-Squeeze", "Range-MeanReversion", "Liquidity-Draw/Sweep", "Trend-Pullback"]}
+            reason_codes = [REGIME_EVENT_CHAOS, REGIME_UNCERTAIN]
+            confidence = min(confidence, 0.5)
+
+        allowed = ["Trend-Pullback", "Breakout-Squeeze", "Squeeze-Breakout", "Range-MeanReversion", "Liquidity-Sweep-Reversal"]
+        blocked: list[str] = []
+        suppressed: list[str] = []
+        if not event_decision.allow_breakout:
+            suppressed.extend(["Breakout-Squeeze", "Squeeze-Breakout"])
+            reason_codes.append(REGIME_BREAKOUT_SUPPRESSED)
+        else:
+            reason_codes.append(REGIME_BREAKOUT_ALLOWED)
+        if not event_decision.allow_mean_reversion:
+            blocked.append("Range-MeanReversion")
+            reason_codes.append(REGIME_MEAN_REVERSION_BLOCKED)
+        else:
+            reason_codes.append(REGIME_MEAN_REVERSION_ALLOWED)
+        if not event_decision.allow_trend_pullback:
+            suppressed.append("Trend-Pullback")
+            reason_codes.append(REGIME_PULLBACK_SUPPRESSED)
+        else:
+            reason_codes.append(REGIME_PULLBACK_ALLOWED)
+
+        if confidence < self.config.REGIME_MIN_CONFIDENCE:
+            if self.config.REGIME_UNCERTAIN_BEHAVIOR == RegimeUncertainBehavior.BLOCK:
+                blocked.extend(allowed)
+            elif self.config.REGIME_UNCERTAIN_BEHAVIOR == RegimeUncertainBehavior.RESTRICT:
+                suppressed.extend(["Breakout-Squeeze", "Squeeze-Breakout"])
+
+        multipliers = {s: 1.0 for s in allowed}
+        for s in suppressed:
+            multipliers[s] = 0.5
+        for s in blocked:
+            multipliers[s] = 0.0
 
         return RegimeDecision(
             instrument=instrument,
-            asof=datetime.now(timezone.utc),
+            asof=asof,
             regime_name=regime_name,
-            regime_confidence=confidence,
+            regime_confidence=max(0.0, min(1.0, confidence)),
             regime_state_label=regime_name,
-            trend_strength_score=f["trend_strength_score"],
-            rotation_score=f["rotation_score"],
-            compression_score=f["compression_score"],
-            expansion_score=f["expansion_score"],
-            event_chaos_score=f["event_chaos_score"],
-            dead_zone_score=f["dead_zone_score"],
-            allowed_strategies=policy["allowed"],
-            suppressed_strategies=policy["suppressed"],
-            blocked_strategies=policy["blocked"],
-            strategy_weight_multipliers=policy["weight_multipliers"],
-            sizing_cap_multiplier=policy["sizing_cap"],
-            order_preference=policy["order_preference"],
-            exit_posture=policy["exit_posture"],
-            reason_codes=list(dict.fromkeys(reasons)),
+            trend_strength_score=max(0.0, min(1.0, trend_strength)),
+            rotation_score=max(0.0, min(1.0, rotation)),
+            compression_score=max(0.0, min(1.0, compression)),
+            expansion_score=max(0.0, min(1.0, expansion)),
+            event_chaos_score=max(0.0, min(1.0, event_chaos)),
+            dead_zone_score=dead_zone,
+            allowed_strategies=allowed,
+            suppressed_strategies=sorted(set(suppressed)),
+            blocked_strategies=sorted(set(blocked)),
+            strategy_weight_multipliers=multipliers,
+            sizing_cap_multiplier=1.0,
+            order_preference="balanced",
+            exit_posture="normal",
+            reason_codes=list(dict.fromkeys(reason_codes)),
         )
-
-    def classify_global_regime(self, regime_decisions: dict[str, RegimeDecision]) -> dict[str, Any]:
-        votes: dict[str, float] = {}
-        for d in regime_decisions.values():
-            votes[d.regime_name] = votes.get(d.regime_name, 0.0) + d.regime_confidence
-        if not votes:
-            return {"regime": "uncertain_mixed", "confidence": 0.0}
-        regime, score = max(votes.items(), key=lambda kv: (kv[1], kv[0]))
-        total = sum(votes.values()) + 1e-9
-        return {"regime": regime, "confidence": score / total, "distribution": votes}
-
-    def get_strategy_policy(self, regime_decision: RegimeDecision) -> dict[str, Any]:
-        return REGIME_POLICIES.get(regime_decision.regime_name, REGIME_POLICIES["uncertain_mixed"])
-            strategy_weight_multipliers=policy["suppression_multipliers"],
-            sizing_cap_multiplier=policy["sizing_cap"],
-            order_preference=policy["order_preference"],
-            exit_posture=policy["exit_posture"],
-            reason_codes=[r for r in reasons if r],
-        )
-
-    def classify_global_regime(self, regime_decisions) -> dict:
-        names = [d.regime_name for d in regime_decisions.values()]
-        if not names:
-            return {"global_regime": "uncertain_mixed", "dispersion": 0.0}
-        mode = max(set(names), key=names.count)
-        return {"global_regime": mode, "dispersion": 1.0 - names.count(mode) / len(names)}
-
-    def get_strategy_policy(self, regime_decision: RegimeDecision) -> dict:
-        return REGIME_POLICY_TABLE.get(regime_decision.regime_name, REGIME_POLICY_TABLE["uncertain_mixed"])
