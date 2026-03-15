@@ -23,6 +23,7 @@ class DecisionGraph:
         liquidity_factor: float,
         has_near_event: bool,
         signed_units: int,
+        sizing_diagnostics: dict,
         portfolio_ctx: PortfolioContext,
         min_score: float,
         max_spread_pctile: float,
@@ -49,6 +50,7 @@ class DecisionGraph:
             "signed_units": int(signed_units),
             "expected_value_proxy": candidate.score,
             "strategy": candidate.strategy,
+            "sizing_rationale": dict(sizing_diagnostics),
         }
         capped = apply_caps(proposal, portfolio_ctx, daily_risk_pct=daily_risk_pct, cluster_risk_pct=cluster_risk_pct)
         if capped.get("blocked"):
@@ -61,10 +63,16 @@ class DecisionGraph:
         result = {
             "approved": True,
             "proposal": capped,
+            "sizing": dict(sizing_diagnostics),
             "order_type": order_type,
             "clips": clips,
             "candidate": asdict(candidate),
         }
         self.event_bus.emit("order_submitted", trace_id, {"instrument": candidate.instrument, "order_type": order_type, "clips": clips})
-        self.audit_sink.append({"trace_id": trace_id, "decision_hash": self.audit_sink.snapshot_hash(result), "decision": result})
+        self.audit_sink.append({
+            "trace_id": trace_id,
+            "decision_hash": self.audit_sink.snapshot_hash(result),
+            "decision": result,
+            "sizing_rationale": dict(sizing_diagnostics),
+        })
         return result
