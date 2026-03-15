@@ -12,6 +12,7 @@ from app.governance.kill_switch import KillSwitch
 from app.governance.policy_engine import policy_check
 from app.models.calibration import ScoreCalibrator
 from app.models.ensemble import choose_best_candidate
+from app.intelligence.orchestrator import IntelligenceOrchestrator
 from app.monitoring.audit import AuditSink
 from app.monitoring.events import EventBus
 from app.monitoring.repository import create_event_repository
@@ -50,6 +51,7 @@ class UpgradedBot:
         self.kill_switch = KillSwitch()
         self.risk_governor = RiskGovernor(max_trades=50)
         self.calibrator = ScoreCalibrator()
+        self.intelligence = IntelligenceOrchestrator()
         self.sizer = PositionSizer()
         self.gov_state = GovernorState()
         self._last_trade_ts = 0.0
@@ -167,6 +169,28 @@ class UpgradedBot:
             if best is None:
                 continue
 
+            intel_snapshot = self.intelligence.build_snapshot(
+                instrument=instrument,
+                bars=bars,
+                features={**feats, "spread_percentile": spread_pctile, "atr_percentile": float(feats.get("atr", 0.5))},
+                context={
+                    "trace_id": trace,
+                    "near_event": near_event,
+                    "minutes_to_event": 30.0 if near_event else 9999.0,
+                    "minutes_since_event": 9999.0,
+                    "event_severity": 0.8 if near_event else 0.0,
+                    "event_relevance": 0.8 if near_event else 0.0,
+                    "slippage_percentile": 0.25,
+                    "execution_cost": spread_pctile / 100.0,
+                    "strategy_performance": {},
+                    "cross_asset": {},
+                    "analog_history": [],
+                },
+                candidate_strategy=best.strategy,
+                raw_confidence=best.score,
+            )
+            best.score = intel_snapshot.calibration.calibrated_confidence
+
             now = time.time()
             if now - self._last_trade_ts < self.settings.min_trade_interval_sec:
                 continue
@@ -207,11 +231,20 @@ class UpgradedBot:
                 cluster_risk_pct=self.settings.cluster_risk_cap,
             )
             decision["regime"] = regime
+            decision["market_intelligence"] = intel_snapshot.to_dict()
             decision["dislocation"] = disloc
             decision["data_quality_status"] = quality.status
             decision["data_quality_reason_codes"] = quality.reason_codes
             if decision.get("approved"):
                 self._last_trade_ts = now
                 self.gov_state.trades_today += 1
+            self.audit.append(
+                {
+                    "type": "market_intelligence",
+                    "trace_id": trace,
+                    "instrument": instrument,
+                    "snapshot": intel_snapshot.to_dict(),
+                }
+            )
             decisions.append(decision)
         return decisions
