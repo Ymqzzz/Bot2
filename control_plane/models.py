@@ -11,6 +11,16 @@ def _flat_dict(obj: Any) -> dict[str, Any]:
         if isinstance(value, datetime):
             out[key] = value.isoformat()
     return out
+def _serialize(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "to_flat_dict"):
+        return value.to_flat_dict()
+    if isinstance(value, list):
+        return [_serialize(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _serialize(v) for k, v in value.items()}
+    return value
 
 
 @dataclass
@@ -37,6 +47,10 @@ class RegimeDecision:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -60,6 +74,10 @@ class EventDecision:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -83,6 +101,10 @@ class ExecutionDecision:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -110,6 +132,10 @@ class AllocationCandidate:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    block_reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -129,6 +155,10 @@ class AllocationDecision:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -146,6 +176,7 @@ class PortfolioStateSnapshot:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -168,6 +199,10 @@ class OrderTacticPlan:
 
     def to_flat_dict(self) -> dict[str, Any]:
         return _flat_dict(self)
+    reason_codes: list[str] = field(default_factory=list)
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _serialize(asdict(self))
 
 
 @dataclass
@@ -190,3 +225,5 @@ class ControlPlaneSnapshot:
             "portfolio_state": self.portfolio_state.to_flat_dict(),
             "reason_codes": self.reason_codes,
         }
+        data = asdict(self)
+        return _serialize(data)

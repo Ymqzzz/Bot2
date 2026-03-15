@@ -33,6 +33,14 @@ from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
 from control_plane import load_config as load_control_plane_config, ControlPlanePipeline
+from research_core import load_config as load_research_core_config
+from research_core.pipeline import ResearchCorePipeline
+from research_core.replay_data import load_replay_stream
+from research_core.scenarios import build_meta_scenario
+
+from control_plane.config import ControlPlaneConfig
+from control_plane.models import AllocationCandidate
+from control_plane.pipeline import ControlPlanePipeline
 
 
 # ========= CONFIG =========
@@ -163,6 +171,80 @@ DEFAULT_SAFE_PROFILE = {
 runtime_state_cache = {"ts": 0.0, "profiles": {}, "quantile": {}, "calibration": {}}
 control_plane_config = load_control_plane_config()
 control_plane_pipeline = ControlPlanePipeline(control_plane_config)
+research_core_pipeline = None
+
+
+def _build_research_stream_loader():
+    def _loader(start_ts, end_ts, instruments, scenario=None):
+        step_ts = [start_ts, end_ts]
+        streams = {
+            "market_intel": [{"ts": start_ts, "value": "snapshot"}],
+            "events": [{"ts": start_ts, "value": "none"}],
+            "execution": [{"ts": start_ts, "value": "trace"}],
+            "candidates": [{"ts": start_ts, "value": ["c1"]}],
+            "approved": [{"ts": start_ts, "value": ["c1"]}],
+        }
+        stream = load_replay_stream(step_ts, streams)
+        for ts in stream.steps:
+            payload = stream.aligned[ts]
+            payload["candidates"] = list((payload.get("candidates") or {}).get("value", []))
+            payload["approved"] = list((payload.get("approved") or {}).get("value", []))
+            payload["execution_outcomes"] = [{"r": 0.0}]
+        return stream
+
+    return _loader
+
+
+def initialize_research_core() -> None:
+    global research_core_pipeline
+    try:
+        cfg = load_research_core_config()
+        if not cfg.RESEARCH_CORE_ENABLED:
+            return
+        research_core_pipeline = ResearchCorePipeline(cfg, replay_loader=_build_research_stream_loader())
+    except Exception as exc:
+        logger.warning(f"research_core init failed: {exc}")
+
+
+def apply_meta_approval(candidate: dict, context: dict) -> dict:
+    if research_core_pipeline is None:
+        return {"action": "approve", "risk_multiplier": 1.0, "reason_codes": ["META_BYPASS_NOT_INITIALIZED"]}
+    decision = research_core_pipeline.meta_approve_candidate(candidate, context)
+    return {
+        "action": decision.action,
+        "risk_multiplier": decision.risk_adjustment_multiplier,
+        "delay_seconds": decision.delay_seconds,
+        "reason_codes": decision.reason_codes,
+    }
+
+
+def run_research_core_mode(mode: str, data_dir: str) -> None:
+    initialize_research_core()
+    if research_core_pipeline is None:
+        raise RuntimeError("research_core not enabled")
+    now = datetime.now(timezone.utc)
+    start_ts = now - timedelta(hours=1)
+    if mode == "replay":
+        result = research_core_pipeline.run_replay(start_ts, now, INSTRUMENTS[:2], scenario=None)
+        print(f"Replay complete: {result.replay_id}")
+        return
+    if mode == "simulate":
+        scenarios = [build_meta_scenario("meta_low_prob", {"hard_reject_low_prob": True})]
+        result = research_core_pipeline.run_simulation_set(start_ts, now, INSTRUMENTS[:2], scenarios)
+        print(f"Simulation complete: {result.simulation_id}")
+        return
+    if mode == "calibrate":
+        sample = [
+            {"strategy": "core", "raw_confidence": 0.65, "won": 1, "r_multiple": 0.8},
+            {"strategy": "core", "raw_confidence": 0.35, "won": 0, "r_multiple": -0.6},
+        ] * 30
+        snaps = research_core_pipeline.refresh_calibration(sample, force=True)
+        print(f"Calibration refreshed: {len(snaps)} snapshots")
+        return
+    if mode == "report":
+        run_research_backtest(data_dir=data_dir, out_dir=os.environ.get("RESEARCH_OUT_DIR", "research_outputs"), wf_state_path=WF_STATE_PATH)
+        return
+    raise RuntimeError("Unknown research submode. Use replay|simulate|calibrate|report")
 
 # ======== COMMENTARY CONFIG ========
 SUMMARY_EVERY_SEC = int(os.environ.get("SUMMARY_EVERY_SEC", "120"))  # default 2min
@@ -292,6 +374,10 @@ daily_trade_budget = {
     "consecutive_losses": 0,
 }
 bandit_state = defaultdict(lambda: defaultdict(lambda: {"alpha": 1.0, "beta": 1.0}))
+
+control_plane_config = ControlPlaneConfig()
+control_plane_pipeline = ControlPlanePipeline(config=control_plane_config, calendar_provider=lambda: fetch_econ_calendar() or []) if control_plane_config.CONTROL_PLANE_ENABLED else None
+last_control_plane_snapshot = None
 
 # Analysis / Ops log
 from threading import Lock
@@ -2776,6 +2862,62 @@ def plan_passes_gates(plan, snapshot):
     return True, "OK"
 
 
+def control_plane_select_plan(instr, snapshot, allowed_impl=None):
+    plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
+    if not plans or control_plane_pipeline is None:
+        return None, [], None
+    open_positions = get_positions_info() or []
+    candidates = []
+    for i, p in enumerate(plans):
+        side = p.get("side", "BUY")
+        candidates.append(AllocationCandidate(
+            candidate_id=f"{instr}-{i}-{p.get('strategy','na')}",
+            instrument=instr,
+            strategy_name=p.get("strategy", ""),
+            side=side,
+            setup_type=p.get("strategy", ""),
+            expected_value=float(p.get("ev_r", 0.0)),
+            confidence=float(p.get("confidence", 0.0)),
+            risk_fraction_requested=float(p.get("risk_fraction", ACCOUNT_RISK_PCT)),
+            risk_fraction_capped=None,
+            regime_score=0.5,
+            event_score=0.5,
+            execution_score=0.5,
+            edge_score=float(p.get("confidence", 0.0)),
+            portfolio_fit_score=0.5,
+            macro_cluster_key="anti_usd" if "USD" in instr and side == "BUY" else "pro_usd" if "USD" in instr else "other",
+            currency_exposure_map={},
+            correlation_bucket=None,
+            priority_score=None,
+            blocked=False,
+            block_reason_codes=[],
+        ))
+    bars = {instr: get_candles(instr, count=120)}
+    cp = control_plane_pipeline.run_cycle(
+        instrument_snapshots={instr: {"event_risk": 1.0 if snapshot.get("event_block") else 0.0, "spread_bps": float(snapshot.get("spread", 0.0)) * 10000}},
+        bars=bars,
+        candidate_pool=candidates,
+        open_positions=open_positions,
+        edge_context={},
+    )
+    approved = set(cp.allocation_decision.approved_candidate_ids if cp.allocation_decision else [])
+    for c in candidates:
+        if c.candidate_id in approved:
+            for p in plans:
+                if p.get("strategy") == c.strategy_name:
+                    exec_dec = cp.execution_decisions.get(c.candidate_id)
+                    tactic = exec_dec.recommended_tactic if exec_dec else None
+                    if tactic == "passive_limit":
+                        p["order_type"] = "LIMIT"
+                    elif tactic == "stop_entry":
+                        p["order_type"] = "STOP"
+                    elif tactic == "market_immediate":
+                        p["order_type"] = "MARKET"
+                    p["control_plane"] = {"candidate_id": c.candidate_id, "recommended_tactic": tactic, "execution_allow": bool(exec_dec.allow_entry) if exec_dec else True}
+                    return p, plans, cp
+    return None, plans, cp
+
+
 def strategy_router(instr, snapshot, allowed_impl=None):
     plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
     debug = []
@@ -4045,6 +4187,7 @@ async def trade_once(instr, director_item=None, world_state=None):
             log_event("RISK", instr, "Daily kill switch active", kill_diag, level=1)
             return
 
+        global last_control_plane_snapshot
         allowed_codes = (director_item or {}).get("strategies") or list(STRATEGY_CATALOG.keys())
         allowed_impl = [strategy_code_to_impl(c) for c in allowed_codes]
         raw_plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
@@ -4060,6 +4203,12 @@ async def trade_once(instr, director_item=None, world_state=None):
                 survivors.append(p)
         plan = max(survivors, key=lambda x: x["rank"]) if survivors else None
         replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": debug, "selected": plan, "control_plane": cp_diag})
+        plan, candidates, cp_snapshot = control_plane_select_plan(instr, snapshot, allowed_impl=allowed_impl)
+        if plan is None:
+            plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
+        else:
+            last_control_plane_snapshot = cp_snapshot.to_flat_dict() if cp_snapshot else None
+        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": candidates, "selected": plan, "control_plane": (cp_snapshot.to_flat_dict() if cp_snapshot else None)})
 
         if not plan:
             daily_trade_budget["missed_trades"] = daily_trade_budget.get("missed_trades", 0) + 1
@@ -5180,12 +5329,14 @@ def run_research_backtest(data_dir, out_dir="research_outputs", wf_state_path=WF
 # ========= MAIN =========
 
 def main():
+    initialize_research_core()
     if "--research" in sys.argv:
         idx = sys.argv.index("--research")
-        data_dir = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else os.environ.get("RESEARCH_DATA_DIR", "")
-        if not data_dir:
-            raise RuntimeError("Provide data dir: python main.py --research <dir>")
-        run_research_backtest(data_dir=data_dir, out_dir=os.environ.get("RESEARCH_OUT_DIR", "research_outputs"), wf_state_path=WF_STATE_PATH)
+        mode = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "report"
+        data_dir = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else os.environ.get("RESEARCH_DATA_DIR", "")
+        if mode == "report" and not data_dir:
+            raise RuntimeError("Provide data dir: python main.py --research report <dir>")
+        run_research_core_mode(mode, data_dir)
         return
     if not all([DISCORD_TOKEN, OANDA_API_KEY, OANDA_ACCOUNTID]):
         raise RuntimeError("Missing environment variables...")
