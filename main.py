@@ -32,6 +32,7 @@ from execution_engine import ExecutionStats, choose_entry_type, clip_staging_pla
 from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
+from control_plane import load_config as load_control_plane_config, ControlPlanePipeline
 from research_core import load_config as load_research_core_config
 from research_core.pipeline import ResearchCorePipeline
 from research_core.replay_data import load_replay_stream
@@ -168,6 +169,8 @@ DEFAULT_SAFE_PROFILE = {
 }
 
 runtime_state_cache = {"ts": 0.0, "profiles": {}, "quantile": {}, "calibration": {}}
+control_plane_config = load_control_plane_config()
+control_plane_pipeline = ControlPlanePipeline(control_plane_config)
 research_core_pipeline = None
 
 
@@ -2765,6 +2768,82 @@ def candidate_plans_from_snapshot(snapshot, allowed_impl=None):
     return cands
 
 
+def _control_candidate_from_plan(plan, snapshot):
+    return {
+        "candidate_id": plan_id(plan),
+        "instrument": plan["instrument"],
+        "strategy_name": plan["strategy"],
+        "side": plan["side"],
+        "setup_type": plan.get("strategy", "default"),
+        "expected_value": float(plan.get("ev_r", 0.0) or 0.0),
+        "confidence": float(plan.get("confidence", 0.0) or 0.0),
+        "risk_fraction_requested": max(0.0001, min(0.02, ACCOUNT_RISK_PCT * float(plan.get("confidence", 0.5)))),
+        "edge_score": float(plan.get("confidence", 0.0) or 0.0),
+        "entry_price": float(plan.get("entry_price", snapshot.get("mid", 0.0)) or 0.0),
+    }
+
+
+def apply_control_plane(instr, snapshot, plans):
+    if not control_plane_config.CONTROL_PLANE_ENABLED or not plans:
+        return plans, {"control_plane": "disabled"}
+    bars = snapshot.get("dfs", {}).get("M5")
+    bars_df = pd.DataFrame()
+    if bars is not None and len(bars) > 0:
+        bars_df = pd.DataFrame({
+            "open": bars["o"],
+            "high": bars["h"],
+            "low": bars["l"],
+            "close": bars["c"],
+        })
+    candidates = [_control_candidate_from_plan(p, snapshot) for p in plans]
+    cp_snapshot = control_plane_pipeline.run_cycle(
+        asof=datetime.now(timezone.utc),
+        instruments=[instr],
+        market_intel_snapshots={instr: {
+            "spread_dislocation": float(snapshot.get("spread_info", {}).get("percentile", 50.0)) / 100.0,
+            "spread_bps": float(snapshot.get("spread", 0.0) or 0.0) * 10000.0,
+            "velocity": float(snapshot.get("breakout", {}).get("mag", 0.0) or 0.0),
+            "liq_factor": float(snapshot.get("liq_factor", 0.5) or 0.5),
+            "impulse": float(abs(snapshot.get("score", 0.0) or 0.0)),
+            "distance_from_trigger_atr": float(abs(snapshot.get("zscore", 0.0) or 0.0)) / 2.0,
+            "escape_velocity": float(snapshot.get("breakout", {}).get("mag", 0.0) or 0.0),
+            "spread_shock": float(snapshot.get("spread_info", {}).get("percentile", 50.0) or 50.0) / 100.0,
+            "micro_noise": float(snapshot.get("atr_pct", 0.0) or 0.0),
+        }},
+        bars={instr: bars_df},
+        candidate_pool=candidates,
+        open_positions=[{"instrument": t.get("instrument"), "units": float(t.get("currentUnits", 0.0))} for t in get_open_trades()],
+        edge_context={},
+    )
+    alloc = cp_snapshot.allocation_decision
+    approved = set(alloc.approved_candidate_ids if alloc else [])
+    tactics = control_plane_pipeline.build_tactic_plans(
+        [c for c in candidates if c["candidate_id"] in approved],
+        cp_snapshot.execution_decisions,
+        cp_snapshot.regime_decisions,
+        cp_snapshot.event_decision,
+    )
+    out = []
+    for p in plans:
+        cid = plan_id(p)
+        if cid in approved:
+            p2 = dict(p)
+            ex = cp_snapshot.execution_decisions.get(cid)
+            tp = tactics.get(cid)
+            if ex:
+                p2.setdefault("metadata", {})["control_execution"] = ex.to_flat_dict()
+            if tp:
+                p2.setdefault("metadata", {})["control_tactic"] = tp.to_flat_dict()
+            out.append(p2)
+    diag = {
+        "event_state": cp_snapshot.event_decision.event_state,
+        "event_phase": cp_snapshot.event_decision.event_phase,
+        "approved": list(approved),
+        "blocked": alloc.blocked_candidate_ids if alloc else [],
+    }
+    return out, diag
+
+
 def plan_passes_gates(plan, snapshot):
     if daily_trade_budget.get("trades_opened_today", 0) >= TRADE_HARD_MAX:
         return False, "DailyMax"
@@ -2951,6 +3030,13 @@ def execute_trade_plan(plan, snapshot):
     pctl_block, pctl_info = spread_percentile_guard(plan["instrument"])
     spread_pctile = float(pctl_info.get("percentile", 50.0))
     order_type = choose_entry_type(plan.get("strategy", ""), float(snapshot.get("breakout", {}).get("mag", 0.0)), float(snapshot.get("liq_factor", 0.0)), spread_pctile)
+    tactic = ((plan.get("metadata") or {}).get("control_tactic") or {}).get("tactic_type")
+    if tactic == "stop_entry":
+        order_type = "STOP"
+    elif tactic in {"passive_limit", "aggressive_limit", "staged_limit"}:
+        order_type = "LIMIT"
+    elif tactic in {"market_immediate", "staged_market", "stop_then_fallback_market"}:
+        order_type = "MARKET"
     if plan["order_type"] == "STOP":
         order_type = "STOP"
     if pctl_block and order_type == "MARKET":
@@ -4104,6 +4190,19 @@ async def trade_once(instr, director_item=None, world_state=None):
         global last_control_plane_snapshot
         allowed_codes = (director_item or {}).get("strategies") or list(STRATEGY_CATALOG.keys())
         allowed_impl = [strategy_code_to_impl(c) for c in allowed_codes]
+        raw_plans = candidate_plans_from_snapshot(snapshot, allowed_impl=allowed_impl)
+        controlled_plans, cp_diag = apply_control_plane(instr, snapshot, raw_plans)
+        debug = []
+        survivors = []
+        for p in controlled_plans:
+            ok, reason = plan_passes_gates(p, snapshot)
+            debug.append({"strategy": p["strategy"], "ev_r": p["ev_r"], "rr": p["rr"], "confidence": p["confidence"], "gate": reason})
+            if ok and strategy_enabled(p["strategy"]):
+                mismatch_penalty = 0.9 if (snapshot["mode"] == "trend" and "Range" in p["strategy"]) else 1.0
+                p["rank"] = p["ev_r"] * p["confidence"] * snapshot["liq_factor"] * mismatch_penalty
+                survivors.append(p)
+        plan = max(survivors, key=lambda x: x["rank"]) if survivors else None
+        replay_log({"ts": utc_now_iso(), "type": "proposals", "instrument": instr, "director": director_item, "candidates": debug, "selected": plan, "control_plane": cp_diag})
         plan, candidates, cp_snapshot = control_plane_select_plan(instr, snapshot, allowed_impl=allowed_impl)
         if plan is None:
             plan, candidates = strategy_router(instr, snapshot, allowed_impl=allowed_impl)
@@ -4113,7 +4212,7 @@ async def trade_once(instr, director_item=None, world_state=None):
 
         if not plan:
             daily_trade_budget["missed_trades"] = daily_trade_budget.get("missed_trades", 0) + 1
-            log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"]}, level=1)
+            log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"], "control_plane": cp_diag}, level=1)
             return
 
         approved_plan, risk_diag = risk_approve_and_size(plan, snapshot)

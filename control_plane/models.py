@@ -5,6 +5,12 @@ from datetime import datetime
 from typing import Any
 
 
+def _flat_dict(obj: Any) -> dict[str, Any]:
+    out = asdict(obj)
+    for key, value in list(out.items()):
+        if isinstance(value, datetime):
+            out[key] = value.isoformat()
+    return out
 def _serialize(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -37,6 +43,10 @@ class RegimeDecision:
     sizing_cap_multiplier: float
     order_preference: str
     exit_posture: str
+    reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -60,6 +70,10 @@ class EventDecision:
     allow_trend_pullback: bool
     event_risk_multiplier: float
     execution_penalty_multiplier: float
+    reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -83,6 +97,10 @@ class ExecutionDecision:
     retry_allowed: bool
     max_retries: int
     cancel_if_not_filled_seconds: int | None
+    reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -110,6 +128,10 @@ class AllocationCandidate:
     correlation_bucket: str | None
     priority_score: float | None
     blocked: bool
+    block_reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     block_reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -129,6 +151,10 @@ class AllocationDecision:
     usd_net_exposure_after: float
     macro_cluster_allocations: dict[str, float]
     correlation_penalties: dict[str, float]
+    reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -149,6 +175,7 @@ class PortfolioStateSnapshot:
     risk_budget_remaining: float
 
     def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
         return _serialize(asdict(self))
 
 
@@ -168,6 +195,10 @@ class OrderTacticPlan:
     cancel_after_seconds: int | None
     fallback_to_market: bool
     fallback_conditions: list[str]
+    reason_codes: list[str]
+
+    def to_flat_dict(self) -> dict[str, Any]:
+        return _flat_dict(self)
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
@@ -185,5 +216,14 @@ class ControlPlaneSnapshot:
     reason_codes: list[str] = field(default_factory=list)
 
     def to_flat_dict(self) -> dict[str, Any]:
+        return {
+            "asof": self.asof.isoformat(),
+            "regime_decisions": {k: v.to_flat_dict() for k, v in self.regime_decisions.items()},
+            "event_decision": self.event_decision.to_flat_dict(),
+            "execution_decisions": {k: v.to_flat_dict() for k, v in self.execution_decisions.items()},
+            "allocation_decision": self.allocation_decision.to_flat_dict() if self.allocation_decision else None,
+            "portfolio_state": self.portfolio_state.to_flat_dict(),
+            "reason_codes": self.reason_codes,
+        }
         data = asdict(self)
         return _serialize(data)
