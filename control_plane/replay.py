@@ -5,11 +5,7 @@ from typing import Any
 from .pipeline import ControlPlanePipeline
 
 
-def replay_cycle(pipeline: ControlPlanePipeline, historical_input: dict[str, Any]) -> dict[str, Any]:
-    snap = pipeline.run_cycle(**historical_input)
-    return snap.to_flat_dict()
-from .pipeline import ControlPlanePipeline
-
-
-def replay_cycle(pipeline: ControlPlanePipeline, **kwargs):
-    return pipeline.run_cycle(**kwargs).to_flat_dict()
+def replay_cycle(pipeline: ControlPlanePipeline, historical_input: dict[str, Any] | None = None, **kwargs) -> dict[str, Any]:
+    payload = dict(historical_input or {})
+    payload.update(kwargs)
+    return pipeline.run_cycle(**payload).to_flat_dict()
