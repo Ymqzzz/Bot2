@@ -1,11 +1,21 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from dataclasses import dataclass
+from datetime import datetime
+from time import perf_counter
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
+from .models import MarketIntelSnapshot, ProviderStatus, SessionContext
 from .storage import SnapshotStorage
 
 
-class MarketIntelPipeline:
+class MarketIntelPipelineError(RuntimeError):
+    pass
+
+
+class LegacyMarketIntelPipeline:
+    """Legacy snapshot builder retained for compatibility tests and migrations."""
+
     def __init__(
         self,
         storage: SnapshotStorage | None = None,
@@ -22,19 +32,13 @@ class MarketIntelPipeline:
         ticks = ticks or []
         close = float(bars[-1].get("close", 0.0)) if bars else 0.0
         volume = float(sum(float(b.get("volume", 0.0) or 0.0) for b in bars)) if bars else 0.0
-        tick_count = len(ticks)
-        return {
-            "bar_count": len(bars),
-            "tick_count": tick_count,
-            "close": close,
-            "volume": volume,
-        }
+        return {"bar_count": len(bars), "tick_count": len(ticks), "close": close, "volume": volume}
 
     @staticmethod
     def _default_quality_builder(provider_statuses: dict[str, Any] | None = None, **_: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         statuses = provider_statuses or {}
         total = len(statuses)
-        healthy = sum(1 for _, payload in statuses.items() if (payload or {}).get("status") in ("ok", "healthy"))
+        healthy = sum(1 for payload in statuses.values() if (payload or {}).get("status") in ("ok", "healthy"))
         availability = (healthy / total) if total else 1.0
         summary = {
             "provider_availability": availability,
@@ -84,7 +88,6 @@ class MarketIntelPipeline:
             "provider_statuses": provider_statuses,
             "usability_flags": usability_flags,
         }
-
         if self.storage:
             self.storage.persist(
                 snapshot=snapshot,
@@ -93,18 +96,7 @@ class MarketIntelPipeline:
                 provider_statuses=provider_statuses,
                 usability_flags=usability_flags,
             )
-
         return snapshot
-from dataclasses import dataclass
-from datetime import datetime
-from time import perf_counter
-from typing import Any, Callable, Dict, List, Mapping, Optional
-
-from .models import MarketIntelSnapshot, ProviderStatus, SessionContext
-
-
-class MarketIntelPipelineError(RuntimeError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -115,10 +107,9 @@ class DependencySpec:
     strict_default: bool = False
 
 
-class MarketIntelPipeline:
+class DependencyOrderedMarketIntelPipeline:
     """Builds a market intelligence snapshot with ordered dependencies."""
 
-    # Ordered according to the integration brief's dependency chain.
     DEPENDENCY_ORDER: List[DependencySpec] = [
         DependencySpec("htf_structure", "htf_structure", "htf_structure"),
         DependencySpec("volume_profile", "volume_profile", "volume_profile"),
@@ -143,30 +134,19 @@ class MarketIntelPipeline:
             "session": SessionContext(instrument=instrument, asof=asof),
             "provider_status": [],
             "features": [],
-            "metadata": {
-                "build_started_at": datetime.utcnow().isoformat(),
-                "strict_mode": strict_mode,
-            },
+            "metadata": {"build_started_at": datetime.utcnow().isoformat(), "strict_mode": strict_mode},
         }
 
         for dep in self.DEPENDENCY_ORDER:
             provider = self.providers.get(dep.provider_key)
             dep_is_strict = strict_mode or dep.strict_default or dep.name in strict_dependencies
-
             if provider is None:
-                self._register_failure(
-                    state,
-                    dep,
-                    dep_is_strict,
-                    reason="provider_not_configured",
-                    raise_on_fail=dep_is_strict,
-                )
+                self._register_failure(state, dep, dep_is_strict, reason="provider_not_configured", raise_on_fail=dep_is_strict)
                 continue
-
             started = perf_counter()
             try:
                 result = provider(instrument, asof, runtime_context)
-            except Exception as exc:  # noqa: BLE001 - strict/non-strict error policy intentionally broad.
+            except Exception as exc:  # noqa: BLE001
                 elapsed_ms = (perf_counter() - started) * 1000.0
                 self._register_failure(
                     state,
@@ -177,11 +157,9 @@ class MarketIntelPipeline:
                     raise_on_fail=dep_is_strict,
                 )
                 continue
-
-            elapsed_ms = (perf_counter() - started) * 1000.0
             state[dep.field] = result
             state["provider_status"].append(
-                ProviderStatus(provider=dep.provider_key, ok=True, latency_ms=elapsed_ms, strict=dep_is_strict)
+                ProviderStatus(provider=dep.provider_key, ok=True, latency_ms=(perf_counter() - started) * 1000.0, strict=dep_is_strict)
             )
 
         state["metadata"]["build_finished_at"] = datetime.utcnow().isoformat()
@@ -211,13 +189,17 @@ class MarketIntelPipeline:
     ) -> None:
         state[dep.field] = [] if dep.field == "features" else None
         state["provider_status"].append(
-            ProviderStatus(
-                provider=dep.provider_key,
-                ok=False,
-                latency_ms=latency_ms,
-                reason=reason,
-                strict=is_strict,
-            )
+            ProviderStatus(provider=dep.provider_key, ok=False, latency_ms=latency_ms, reason=reason, strict=is_strict)
         )
         if raise_on_fail:
             raise MarketIntelPipelineError(f"Strict dependency '{dep.name}' failed: {reason}")
+
+
+MarketIntelPipeline = DependencyOrderedMarketIntelPipeline
+
+__all__ = [
+    "LegacyMarketIntelPipeline",
+    "DependencyOrderedMarketIntelPipeline",
+    "MarketIntelPipeline",
+    "MarketIntelPipelineError",
+]

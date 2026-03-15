@@ -17,6 +17,7 @@ from app.intelligence.strategy_health import StrategyHealthEngine
 from app.intelligence.structure import StructureEngine
 from app.intelligence.sweep import SweepEngine
 from app.intelligence.trade_quality import TradeQualityEngine
+from app.intelligence.uncertainty import UncertaintyEngine
 
 
 class IntelligenceOrchestrator:
@@ -32,6 +33,7 @@ class IntelligenceOrchestrator:
         self.cross_asset = CrossAssetEngine()
         self.trade_quality = TradeQualityEngine()
         self.analog = AnalogEngine()
+        self.uncertainty = UncertaintyEngine()
         self.calibrator = ConfidenceCalibrator()
 
     def build_snapshot(
@@ -48,7 +50,6 @@ class IntelligenceOrchestrator:
         ts = timestamp or datetime.utcnow()
         trace_id = context.get("trace_id") or str(uuid.uuid4())
         data = EngineInput(timestamp=ts, instrument=instrument, trace_id=trace_id, bars=bars, features=features, context=context)
-        integrity: dict[str, bool] = {}
 
         regime = self.regime.compute(data)
         mtf = self.mtf.compute(data)
@@ -63,9 +64,11 @@ class IntelligenceOrchestrator:
             timestamp=ts,
             instrument=instrument,
             trace_id=trace_id,
+            calibrated_score=raw_confidence,
             regime=regime,
             mtf=mtf,
             structure=structure,
+            liquidity=liquidity,
             sweep=sweep,
             event_risk=event_risk,
             instrument_health=inst_health,
@@ -73,8 +76,9 @@ class IntelligenceOrchestrator:
             cross_asset=cross,
             candidate_strategy=candidate_strategy,
             execution_cost=float(context.get("execution_cost", 0.2)),
+            portfolio_conflict=float(context.get("portfolio_conflict", 0.0)),
         )
-        snapshot = MarketIntelligenceSnapshot(
+        base_snapshot = MarketIntelligenceSnapshot(
             timestamp=ts,
             instrument=instrument,
             trace_id=trace_id,
@@ -90,9 +94,23 @@ class IntelligenceOrchestrator:
             strategy_health=strat_health,
             cross_asset=cross,
             trade_quality=quality,
-            integrity_flags=integrity,
+            integrity_flags={},
         )
-        analog = self.analog.compute(snapshot, context.get("analog_history", []))
-        enriched = MarketIntelligenceSnapshot(**{**snapshot.__dict__, "analog": analog})
+
+        analog = self.analog.compute(base_snapshot, context.get("analog_history", []), candidate_strategy)
+        uncertainty = self.uncertainty.compute(
+            timestamp=ts,
+            instrument=instrument,
+            trace_id=trace_id,
+            mtf=mtf,
+            structure=structure,
+            sweep=sweep,
+            event_risk=event_risk,
+            strategy_health=strat_health,
+            cross_asset=cross,
+            analog_confidence=analog.analog_confidence,
+            spread_percentile=float(features.get("spread_percentile", 50.0)),
+        )
+        enriched = MarketIntelligenceSnapshot(**{**base_snapshot.__dict__, "analog": analog, "uncertainty": uncertainty})
         calib = self.calibrator.compute(enriched, raw_confidence)
         return MarketIntelligenceSnapshot(**{**enriched.__dict__, "calibration": calib})

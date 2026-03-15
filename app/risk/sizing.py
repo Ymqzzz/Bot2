@@ -13,6 +13,9 @@ class SizingDiagnostics:
     portfolio_budget_pct: float
     max_units_cap: int
     capped: bool
+    quality_multiplier: float = 1.0
+    uncertainty_multiplier: float = 1.0
+    strategy_multiplier: float = 1.0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -55,6 +58,9 @@ class PositionSizer:
         open_positions: list[dict],
         daily_risk_pct: float,
         cluster_risk_pct: float,
+        quality_multiplier: float = 1.0,
+        uncertainty_multiplier: float = 1.0,
+        strategy_multiplier: float = 1.0,
     ) -> SizingDiagnostics:
         nav_f = max(float(nav), 0.0)
         if nav_f <= 0:
@@ -77,7 +83,10 @@ class PositionSizer:
 
         risk_budget_notional = nav_f * portfolio_budget_pct
         denom = max(atr_f * 10_000.0 * dislocation_multiplier, 1e-9)
-        raw_units = risk_budget_notional * confidence_multiplier * spread_multiplier * stop_volatility_multiplier / denom
+        q_mult = self._clamp(float(quality_multiplier), 0.2, 1.8)
+        u_mult = self._clamp(float(uncertainty_multiplier), 0.2, 1.0)
+        s_mult = self._clamp(float(strategy_multiplier), 0.25, 1.5)
+        raw_units = risk_budget_notional * confidence_multiplier * spread_multiplier * stop_volatility_multiplier * q_mult * u_mult * s_mult / denom
 
         max_units_cap = int(max(0.0, nav_f * self.max_notional_nav_multiple / max(float(entry_price), 1e-6)))
         units_abs = int(max(0.0, raw_units))
@@ -94,4 +103,7 @@ class PositionSizer:
             portfolio_budget_pct=portfolio_budget_pct,
             max_units_cap=max_units_cap,
             capped=capped,
+            quality_multiplier=q_mult,
+            uncertainty_multiplier=u_mult,
+            strategy_multiplier=s_mult,
         )
