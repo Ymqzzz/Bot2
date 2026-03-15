@@ -10,3 +10,10 @@ __all__ = [
     "validate_deterministic_replay",
     "SnapshotStorage",
 ]
+"""Market intelligence providers package."""
+"""Market intelligence package."""
+
+from .models import MarketIntelSnapshot
+from .pipeline import MarketIntelPipeline
+
+__all__ = ["MarketIntelSnapshot", "MarketIntelPipeline"]

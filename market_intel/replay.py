@@ -62,3 +62,14 @@ def validate_deterministic_replay(
     config: dict[str, Any] | None = None,
 ) -> bool:
     return MarketIntelReplayer(pipeline).validate_equal(frames=frames, config=config)
+from typing import Iterable, List
+
+from .models import MarketIntelSnapshot
+
+
+class MarketIntelReplay:
+    def __init__(self, snapshots: Iterable[MarketIntelSnapshot]) -> None:
+        self._snapshots: List[MarketIntelSnapshot] = list(snapshots)
+
+    def iter_snapshots(self) -> Iterable[MarketIntelSnapshot]:
+        return iter(self._snapshots)
