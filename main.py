@@ -34,6 +34,7 @@ from execution_engine import ExecutionStats, choose_entry_type, clip_staging_pla
 from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
+from market_intel.providers.oanda_adapter import OandaAdapter
 from trade_intel import load_config as load_trade_intel_config
 from trade_intel.pipeline import build_default_pipeline
 from control_plane import load_config as load_control_plane_config, ControlPlanePipeline
@@ -174,6 +175,7 @@ DEFAULT_SAFE_PROFILE = {
 }
 
 runtime_state_cache = {"ts": 0.0, "profiles": {}, "quantile": {}, "calibration": {}}
+oanda_provider = None
 control_plane_config = load_control_plane_config()
 control_plane_pipeline = ControlPlanePipeline(control_plane_config)
 research_core_pipeline = None
@@ -606,7 +608,9 @@ def get_orderflow_features(instr, price, atr_val):
     if cached and now - cached["ts"] < ORDERFLOW_TTL:
         return cached["data"]
 
-    features = {
+    provider = get_oanda_provider()
+    res = provider.get_orderflow(instr, price=price, atr_value=atr_val)
+    features = res.data if res.data else {
         "available": False,
         "positionbook_available": False,
         "orderbook_available": False,
@@ -622,61 +626,9 @@ def get_orderflow_features(instr, price, atr_val):
         "tp_wall_adjusted": False,
         "tp_wall_cut_distance_atr": 0.0,
     }
-
-    try:
-        pb = safe_get(f"{HOST}/instruments/{instr}/positionBook") or {}
-        buckets = (pb.get("positionBook") or {}).get("buckets", pb.get("buckets", []))
-        longs = [_float_any(b, ["longCountPercent", "longCount"], 0.0) for b in buckets]
-        shorts = [_float_any(b, ["shortCountPercent", "shortCount"], 0.0) for b in buckets]
-        if longs and shorts:
-            raw_skew = (sum(longs) - sum(shorts)) / (sum(longs) + sum(shorts) + 1e-9)
-            norm = float(np.tanh(raw_skew * 3.0))
-            features["positionbook_available"] = True
-            features["pos_skew_norm"] = max(-1.0, min(1.0, norm))
-            features["crowding_strength"] = min(1.0, abs(features["pos_skew_norm"]))
-    except Exception:
-        pass
-
-    try:
-        ob = safe_get(f"{HOST}/instruments/{instr}/orderBook") or {}
-        buckets = (ob.get("orderBook") or {}).get("buckets", ob.get("buckets", []))
-        walls_above = []
-        walls_below = []
-        strengths = []
-        for b in buckets:
-            px = _float_any(b, ["price"], 0.0)
-            longp = _float_any(b, ["longCountPercent", "longCount"], 0.0)
-            shortp = _float_any(b, ["shortCountPercent", "shortCount"], 0.0)
-            ordp = _float_any(b, ["orderCountPercent", "orderCount"], longp + shortp)
-            strength = max(ordp, longp + shortp)
-            if px <= 0 or strength <= 0:
-                continue
-            strengths.append(strength)
-            if px >= price:
-                walls_above.append((px, strength))
-            else:
-                walls_below.append((px, strength))
-        if strengths:
-            denom = max(np.percentile(strengths, 90), 1e-9)
-            walls_above = sorted(walls_above, key=lambda x: abs(x[0] - price))[:5]
-            walls_below = sorted(walls_below, key=lambda x: abs(x[0] - price))[:5]
-            if walls_above:
-                px, st = walls_above[0]
-                features["nearest_wall_above_px"] = px
-                features["wall_strength_above"] = float(min(2.0, st / denom))
-                features["wall_distance_atr_above"] = float(abs(px - price) / max(atr_val, 1e-9))
-            if walls_below:
-                px, st = walls_below[0]
-                features["nearest_wall_below_px"] = px
-                features["wall_strength_below"] = float(min(2.0, st / denom))
-                features["wall_distance_atr_below"] = float(abs(price - px) / max(atr_val, 1e-9))
-            features["orderbook_available"] = True
-    except Exception:
-        pass
-
-    features["available"] = features["positionbook_available"] or features["orderbook_available"]
     orderflow_cache[instr] = {"ts": now, "data": features}
     return features
+
 
 
 def apply_orderflow_confidence_adjustments(direction, confidence, pwin, evr, off):
@@ -1247,6 +1199,18 @@ def safe_post(url, json_data=None, retries=3):
             time.sleep(1)
     return None
 
+def get_oanda_provider():
+    global oanda_provider
+    if oanda_provider is None:
+        oanda_provider = OandaAdapter(
+            host=HOST,
+            account_id=OANDA_ACCOUNTID,
+            safe_get=safe_get,
+            price_cache=price_cache,
+            spread_cache=spread_cache,
+        )
+    return oanda_provider
+
 def get_account_summary():
     data = safe_get(f"{HOST}/accounts/{OANDA_ACCOUNTID}/summary")
     if data: 
@@ -1503,25 +1467,12 @@ def refresh_pricing_once():
 # ========= MARKET DATA =========
 
 def get_candles(instr, count=500, granularity=GRANULARITY):
-    params = {"price":"M","granularity":granularity,"count":count}
-    data = safe_get(f"{HOST}/instruments/{instr}/candles", params=params)
-    if not data or "candles" not in data: 
+    provider = get_oanda_provider()
+    res = provider.get_bars(instr, count=count, granularity=granularity)
+    if not res.ok:
         return None
-    rows=[]
-    for c in data["candles"]:
-        if not c.get("complete"): 
-            continue
-        mid = c["mid"]
-        rows.append({
-            "time": c["time"],
-            "o": float(mid["o"]),
-            "h": float(mid["h"]),
-            "l": float(mid["l"]),
-            "c": float(mid["c"]),
-            "v": int(c.get("volume", 0))  # <-- add this line
-        })
-    df = pd.DataFrame(rows)
-    return df if len(df)>0 else None
+    return res.data
+
 
 
 # ========= INDICATORS =========
@@ -1596,7 +1547,8 @@ def position_book_skew(pb):
     return (longp - shortp)/100.0
 
 def fetch_positionbook(instr):
-    return safe_get(f"{HOST}/instruments/{instr}/positionBook") or {}
+    provider = get_oanda_provider()
+    return provider._positionbook(instr)
 
 def build_signals(df, instr):
     s = {}
@@ -1868,29 +1820,14 @@ def fetch_econ_calendar():
     return econ_cache["data"]
 
 def fetch_positioning(instr):
-    pb = safe_get(f"{HOST}/instruments/{instr}/positionBook") or {}
-    ob = safe_get(f"{HOST}/instruments/{instr}/orderBook") or {}
-    skew = 0.0; tops=[]
-    try:
-        buckets = (pb.get("positionBook") or {}).get("buckets", [])
-        longs = [float(b.get("longCountPercent",0)) for b in buckets if "longCountPercent" in b]
-        shorts= [float(b.get("shortCountPercent",0)) for b in buckets if "shortCountPercent" in b]
-        if longs and shorts:
-            skew = (sum(longs)/len(longs) - sum(shorts)/len(shorts))/100.0
-    except Exception:
-        pass
-    try:
-        ob_b = (ob.get("orderBook") or {}).get("buckets", [])
-        mid = price_cache.get(instr, np.nan)
-        def level_score(b):
-            p = float(b.get("price", 0))
-            return -abs(p - (mid if mid==mid else p))
-        tops = sorted(ob_b, key=level_score)[:3]
-        tops = [{"price": float(b.get("price",0))} for b in tops]
-    except Exception:
-        tops = []
-    contrarian = "fade_longs" if skew>0.15 else "fade_shorts" if skew<-0.15 else "neutral"
-    return {"skew": skew, "top_levels": tops, "contrarian": contrarian}
+    provider = get_oanda_provider()
+    mid = price_cache.get(instr, np.nan)
+    res = provider.get_positioning(instr, mid_price=float(mid if mid == mid else 0.0))
+    if res.ok and res.data:
+        return res.data
+    return {"skew": 0.0, "top_levels": [], "contrarian": "neutral"}
+
+
 
 def fetch_COT():
     now = time.time()

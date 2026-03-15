@@ -1,3 +1,4 @@
+"""Market intelligence providers package."""
 """Market intelligence package."""
 
 from .models import MarketIntelSnapshot
