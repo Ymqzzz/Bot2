@@ -17,6 +17,7 @@ from app.intelligence.strategy_health import StrategyHealthEngine
 from app.intelligence.structure import StructureEngine
 from app.intelligence.sweep import SweepEngine
 from app.intelligence.trade_quality import TradeQualityEngine
+from app.intelligence.uncertainty import UncertaintyEngine
 
 
 class IntelligenceOrchestrator:
@@ -30,6 +31,7 @@ class IntelligenceOrchestrator:
         self.instrument_health = InstrumentHealthEngine()
         self.strategy_health = StrategyHealthEngine()
         self.cross_asset = CrossAssetEngine()
+        self.uncertainty = UncertaintyEngine()
         self.trade_quality = TradeQualityEngine()
         self.analog = AnalogEngine()
         self.calibrator = ConfidenceCalibrator()
@@ -59,11 +61,11 @@ class IntelligenceOrchestrator:
         inst_health = self.instrument_health.compute(data, structure, event_risk)
         strat_health = self.strategy_health.compute(data)
         cross = self.cross_asset.compute(data, mtf)
-        quality = self.trade_quality.compute(
+
+        preliminary_uncertainty = self.uncertainty.compute(
             timestamp=ts,
             instrument=instrument,
             trace_id=trace_id,
-            regime=regime,
             mtf=mtf,
             structure=structure,
             sweep=sweep,
@@ -71,9 +73,26 @@ class IntelligenceOrchestrator:
             instrument_health=inst_health,
             strategy_health=strat_health,
             cross_asset=cross,
+            analog_confidence=min(1.0, len(context.get("analog_history", [])) / 20.0),
+        )
+        quality = self.trade_quality.compute(
+            timestamp=ts,
+            instrument=instrument,
+            trace_id=trace_id,
+            regime=regime,
+            mtf=mtf,
+            structure=structure,
+            liquidity=liquidity,
+            sweep=sweep,
+            event_risk=event_risk,
+            instrument_health=inst_health,
+            strategy_health=strat_health,
+            cross_asset=cross,
             candidate_strategy=candidate_strategy,
             execution_cost=float(context.get("execution_cost", 0.2)),
+            uncertainty=preliminary_uncertainty,
         )
+
         snapshot = MarketIntelligenceSnapshot(
             timestamp=ts,
             instrument=instrument,
@@ -90,9 +109,42 @@ class IntelligenceOrchestrator:
             strategy_health=strat_health,
             cross_asset=cross,
             trade_quality=quality,
+            uncertainty=preliminary_uncertainty,
             integrity_flags=integrity,
         )
+
         analog = self.analog.compute(snapshot, context.get("analog_history", []))
-        enriched = MarketIntelligenceSnapshot(**{**snapshot.__dict__, "analog": analog})
+        uncertainty = self.uncertainty.compute(
+            timestamp=ts,
+            instrument=instrument,
+            trace_id=trace_id,
+            mtf=mtf,
+            structure=structure,
+            sweep=sweep,
+            event_risk=event_risk,
+            instrument_health=inst_health,
+            strategy_health=strat_health,
+            cross_asset=cross,
+            analog_confidence=analog.analog_confidence,
+        )
+        quality = self.trade_quality.compute(
+            timestamp=ts,
+            instrument=instrument,
+            trace_id=trace_id,
+            regime=regime,
+            mtf=mtf,
+            structure=structure,
+            liquidity=liquidity,
+            sweep=sweep,
+            event_risk=event_risk,
+            instrument_health=inst_health,
+            strategy_health=strat_health,
+            cross_asset=cross,
+            candidate_strategy=candidate_strategy,
+            execution_cost=float(context.get("execution_cost", 0.2)),
+            uncertainty=uncertainty,
+        )
+
+        enriched = MarketIntelligenceSnapshot(**{**snapshot.__dict__, "analog": analog, "uncertainty": uncertainty, "trade_quality": quality})
         calib = self.calibrator.compute(enriched, raw_confidence)
         return MarketIntelligenceSnapshot(**{**enriched.__dict__, "calibration": calib})

@@ -6,7 +6,7 @@ from app.intelligence.models import ConfidenceCalibrationState, Evidence, Market
 
 class ConfidenceCalibrator:
     def compute(self, snapshot: MarketIntelligenceSnapshot, raw_confidence: float) -> ConfidenceCalibrationState:
-        uncertainty = snapshot.trade_quality.uncertainty_score if snapshot.trade_quality else 0.5
+        uncertainty = snapshot.uncertainty.uncertainty_score if snapshot.uncertainty else (snapshot.trade_quality.uncertainty_score if snapshot.trade_quality else 0.5)
         analog_boost = (snapshot.analog.analog_confidence - 0.5) * 0.2 if snapshot.analog else 0.0
         penalty = uncertainty * 0.35
         calibrated = clamp(raw_confidence - penalty + analog_boost)

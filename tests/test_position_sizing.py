@@ -55,3 +55,13 @@ def test_units_respect_cap_and_emit_cap_diagnostics():
 
     assert abs(out.signed_units) <= out.max_units_cap
     assert out.capped is True
+
+
+def test_intelligence_multipliers_affect_units():
+    sizer = PositionSizer()
+    baseline = _compute(sizer)
+    penalized = _compute(sizer, quality_multiplier=0.4, uncertainty_multiplier=0.5, strategy_health_multiplier=0.6)
+    boosted = _compute(sizer, quality_multiplier=1.2, uncertainty_multiplier=1.0, strategy_health_multiplier=1.1)
+
+    assert abs(penalized.signed_units) < abs(baseline.signed_units)
+    assert abs(boosted.signed_units) > abs(baseline.signed_units)

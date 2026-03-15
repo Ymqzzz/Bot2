@@ -189,7 +189,10 @@ class UpgradedBot:
                 candidate_strategy=best.strategy,
                 raw_confidence=best.score,
             )
-            best.score = intel_snapshot.calibration.calibrated_confidence
+            refined_score = intel_snapshot.calibration.calibrated_confidence
+            refined_score *= (0.75 + 0.25 * intel_snapshot.trade_quality.quality_score)
+            refined_score *= (1.0 - 0.25 * intel_snapshot.uncertainty.ranking_penalty)
+            best.score = max(0.0, min(1.0, refined_score))
 
             now = time.time()
             if now - self._last_trade_ts < self.settings.min_trade_interval_sec:
@@ -206,6 +209,9 @@ class UpgradedBot:
                 open_positions=broker_ctx.open_positions,
                 daily_risk_pct=self.settings.risk_budget_daily,
                 cluster_risk_pct=self.settings.cluster_risk_cap,
+                quality_multiplier=intel_snapshot.trade_quality.size_multiplier_hint,
+                uncertainty_multiplier=intel_snapshot.uncertainty.size_penalty_multiplier,
+                strategy_health_multiplier=intel_snapshot.strategy_health.throttle_multipliers.get(best.strategy, 1.0),
             )
             if sizing.signed_units == 0:
                 trace = self.events.new_trace()

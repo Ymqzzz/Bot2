@@ -1,8 +1,14 @@
-from .pipeline import MarketIntelPipeline
-from .replay import ReplayFrame, MarketIntelReplayer, rebuild_snapshots, validate_deterministic_replay
+"""Market intelligence package."""
+
+from .models import MarketIntelSnapshot
+from .pipeline import DependencyOrderedMarketIntelPipeline, LegacyMarketIntelPipeline, MarketIntelPipeline
+from .replay import MarketIntelReplayer, ReplayFrame, rebuild_snapshots, validate_deterministic_replay
 from .storage import SnapshotStorage
 
 __all__ = [
+    "MarketIntelSnapshot",
+    "DependencyOrderedMarketIntelPipeline",
+    "LegacyMarketIntelPipeline",
     "MarketIntelPipeline",
     "ReplayFrame",
     "MarketIntelReplayer",
@@ -10,10 +16,3 @@ __all__ = [
     "validate_deterministic_replay",
     "SnapshotStorage",
 ]
-"""Market intelligence providers package."""
-"""Market intelligence package."""
-
-from .models import MarketIntelSnapshot
-from .pipeline import MarketIntelPipeline
-
-__all__ = ["MarketIntelSnapshot", "MarketIntelPipeline"]
