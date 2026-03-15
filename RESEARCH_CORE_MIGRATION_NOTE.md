@@ -12,3 +12,6 @@
 ## New hooks
 - Calibration refresh hook for startup/research paths.
 - Candidate-level meta-approval hook for decision gating.
+
+## Deprecation notice
+- The legacy direct orchestration path in `main.py` is now deprecated. Research-core meta approval should run through the coordinator-driven lifecycle in `app/runtime/engine.py`.
