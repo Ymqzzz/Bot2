@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from .models import MarketIntelSnapshot, ProviderStatus, SessionContext
 from .storage import SnapshotStorage
@@ -15,16 +16,41 @@ class MarketIntelPipelineError(RuntimeError):
 
 class LegacyMarketIntelPipeline:
     """Legacy snapshot builder kept for compatibility/testing of old storage contract."""
+    """Legacy snapshot builder retained for compatibility tests and migrations."""
+@dataclass(frozen=True)
+class DependencySpec:
+    name: str
+    field: str
+    provider_key: str
+    strict_default: bool = False
+
+
+class MarketIntelPipeline:
+    """Market intel pipeline supporting both snapshot modes used in the repo/tests."""
+
+    DEPENDENCY_ORDER: List[DependencySpec] = [
+        DependencySpec("htf_structure", "htf_structure", "htf_structure"),
+        DependencySpec("volume_profile", "volume_profile", "volume_profile"),
+        DependencySpec("liquidity_map", "liquidity_map", "liquidity_map"),
+        DependencySpec("orderbook_proxy", "orderbook_proxy", "orderbook_proxy"),
+        DependencySpec("gamma_proxy", "gamma_proxy", "gamma_proxy"),
+        DependencySpec("microstructure", "microstructure", "microstructure"),
+        DependencySpec("cross_asset", "cross_asset", "cross_asset"),
+        DependencySpec("execution_quality", "execution_quality", "execution_quality"),
+        DependencySpec("features", "features", "features"),
+    ]
 
     def __init__(
         self,
         storage: SnapshotStorage | None = None,
         feature_builder: Callable[..., dict[str, Any]] | None = None,
         quality_builder: Callable[..., tuple[dict[str, Any], dict[str, Any]]] | None = None,
-    ):
+        providers: Optional[Mapping[str, Callable[[str, datetime, dict], Any]]] = None,
+    ) -> None:
         self.storage = storage
         self.feature_builder = feature_builder or self._default_feature_builder
         self.quality_builder = quality_builder or self._default_quality_builder
+        self.providers: Dict[str, Callable[[str, datetime, dict], Any]] = dict(providers or {})
 
     @staticmethod
     def _default_feature_builder(bars: list[dict] | None = None, ticks: list[dict] | None = None, **_: Any) -> dict[str, Any]:
@@ -32,6 +58,7 @@ class LegacyMarketIntelPipeline:
         ticks = ticks or []
         close = float(bars[-1].get("close", 0.0)) if bars else 0.0
         volume = float(sum(float(b.get("volume", 0.0) or 0.0) for b in bars)) if bars else 0.0
+        return {"bar_count": len(bars), "tick_count": len(ticks), "close": close, "volume": volume}
         return {
             "bar_count": len(bars),
             "tick_count": len(ticks),
@@ -43,20 +70,26 @@ class LegacyMarketIntelPipeline:
     def _default_quality_builder(provider_statuses: dict[str, Any] | None = None, **_: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         statuses = provider_statuses or {}
         total = len(statuses)
-        healthy = sum(1 for _, payload in statuses.items() if (payload or {}).get("status") in ("ok", "healthy"))
+        healthy = sum(1 for payload in statuses.values() if (payload or {}).get("status") in ("ok", "healthy"))
         availability = (healthy / total) if total else 1.0
-        summary = {
-            "provider_availability": availability,
-            "provider_count": total,
-            "healthy_provider_count": healthy,
-        }
-        usability_flags = {
-            "sufficient_provider_coverage": availability >= 0.7,
-            "is_usable": availability >= 0.5,
-        }
-        return summary, usability_flags
+        return (
+            {
+                "provider_availability": availability,
+                "provider_count": total,
+                "healthy_provider_count": healthy,
+            },
+            {
+                "sufficient_provider_coverage": availability >= 0.7,
+                "is_usable": availability >= 0.5,
+            },
+        )
 
-    def build_snapshot(
+    def build_snapshot(self, *args, **kwargs):
+        if "timestamp" in kwargs:
+            return self._build_storage_snapshot(**kwargs)
+        return self._build_provider_snapshot(*args, **kwargs)
+
+    def _build_storage_snapshot(
         self,
         *,
         timestamp: str,
@@ -93,7 +126,6 @@ class LegacyMarketIntelPipeline:
             "provider_statuses": provider_statuses,
             "usability_flags": usability_flags,
         }
-
         if self.storage:
             self.storage.persist(
                 snapshot=snapshot,
@@ -102,7 +134,6 @@ class LegacyMarketIntelPipeline:
                 provider_statuses=provider_statuses,
                 usability_flags=usability_flags,
             )
-
         return snapshot
 
 
@@ -133,6 +164,12 @@ class DependencyOrderedMarketIntelPipeline:
         self.providers: Dict[str, Callable[[str, datetime, dict], Any]] = dict(providers or {})
 
     def build_snapshot(self, instrument: str, asof: datetime, runtime_context: Optional[dict] = None) -> MarketIntelSnapshot:
+    def _build_provider_snapshot(
+        self,
+        instrument: str,
+        asof: datetime,
+        runtime_context: Optional[dict] = None,
+    ) -> MarketIntelSnapshot:
         runtime_context = runtime_context or {}
         strict_mode = bool(runtime_context.get("strict_mode", False))
         strict_dependencies = set(runtime_context.get("strict_dependencies", []))
@@ -146,6 +183,7 @@ class DependencyOrderedMarketIntelPipeline:
                 "strict_mode": strict_mode,
                 "pipeline_class": self.__class__.__name__,
             },
+            "metadata": {"build_started_at": datetime.utcnow().isoformat(), "strict_mode": strict_mode},
         }
 
         for dep in self.DEPENDENCY_ORDER:
@@ -154,7 +192,6 @@ class DependencyOrderedMarketIntelPipeline:
             if provider is None:
                 self._register_failure(state, dep, dep_is_strict, reason="provider_not_configured", raise_on_fail=dep_is_strict)
                 continue
-
             started = perf_counter()
             try:
                 result = provider(instrument, asof, runtime_context)
@@ -169,11 +206,9 @@ class DependencyOrderedMarketIntelPipeline:
                     raise_on_fail=dep_is_strict,
                 )
                 continue
-
-            elapsed_ms = (perf_counter() - started) * 1000.0
             state[dep.field] = result
             state["provider_status"].append(
-                ProviderStatus(provider=dep.provider_key, ok=True, latency_ms=elapsed_ms, strict=dep_is_strict)
+                ProviderStatus(provider=dep.provider_key, ok=True, latency_ms=(perf_counter() - started) * 1000.0, strict=dep_is_strict)
             )
 
         state["metadata"]["build_finished_at"] = datetime.utcnow().isoformat()
@@ -214,6 +249,8 @@ MarketIntelPipeline = DependencyOrderedMarketIntelPipeline
 __all__ = [
     "DependencyOrderedMarketIntelPipeline",
     "LegacyMarketIntelPipeline",
+    "LegacyMarketIntelPipeline",
+    "DependencyOrderedMarketIntelPipeline",
     "MarketIntelPipeline",
     "MarketIntelPipelineError",
 ]

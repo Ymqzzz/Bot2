@@ -15,8 +15,8 @@ class BotSettings:
     cluster_risk_cap: float
     min_trade_interval_sec: int
     max_trade_interval_sec: int
-    monitoring_events_db_url: str
-    monitoring_cache_size: int
+    monitoring_events_db_url: str = "sqlite:///research_outputs/monitoring/events.db"
+    monitoring_cache_size: int = 2000
 
     @staticmethod
     def from_env() -> "BotSettings":

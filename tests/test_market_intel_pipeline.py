@@ -9,6 +9,12 @@ from market_intel.pipeline import (
     MarketIntelPipelineError,
 )
 from market_intel.models import MarketIntelSnapshot, SessionContext
+from market_intel.pipeline import (
+    DependencyOrderedMarketIntelPipeline,
+    LegacyMarketIntelPipeline,
+    MarketIntelPipeline,
+    MarketIntelPipelineError,
+)
 
 
 def test_to_flat_dict_flattens_dataclass_tree() -> None:
@@ -43,3 +49,8 @@ def test_pipeline_strict_failure_raises() -> None:
 
     with pytest.raises(MarketIntelPipelineError):
         pipeline.build_snapshot("EURUSD", datetime(2026, 1, 1), runtime_context={"strict_mode": False, "strict_dependencies": ["execution_quality"]})
+
+
+def test_market_intel_pipeline_alias_points_to_dependency_ordered() -> None:
+    assert MarketIntelPipeline is DependencyOrderedMarketIntelPipeline
+    assert MarketIntelPipeline is not LegacyMarketIntelPipeline
