@@ -6,3 +6,5 @@ discord.py
 scikit-learn
 statsmodels
 scipy
+psutil
+python-dotenv
