@@ -42,3 +42,6 @@
 
 ## Runtime hooks
 - Event + regime + execution + allocator + tactic decisions are orchestrated by `ControlPlanePipeline`.
+
+## Deprecation notice
+- The legacy direct orchestration path in `main.py` is now deprecated. Runtime control-plane integration is expected to run through `app/runtime/engine.py` via the coordinator adapters.

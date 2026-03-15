@@ -12,7 +12,7 @@ class RegimeUncertainBehavior(str, Enum):
 
 
 def _b(name: str, default: bool) -> bool:
-    return str(os.environ.get(name, str(default))).lower() in {"1", "true", "yes", "on"}
+    return str(os.environ.get(name, str(default))).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _f(name: str, default: float) -> float:
@@ -21,27 +21,6 @@ def _f(name: str, default: float) -> float:
 
 def _i(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
-import os
-from dataclasses import dataclass
-from enum import Enum
-
-
-class RegimeUncertainBehavior(str, Enum):
-    degrade = "degrade"
-    restrict = "restrict"
-    block = "block"
-
-
-def _b(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _f(name: str, default: str) -> float:
-    return float(os.environ.get(name, default))
-
-
-def _i(name: str, default: str) -> int:
-    return int(os.environ.get(name, default))
 
 
 @dataclass(frozen=True)
@@ -114,68 +93,3 @@ def load_config() -> ControlPlaneConfig:
     cfg = ControlPlaneConfig()
     cfg.validate()
     return cfg
-    CONTROL_PLANE_ENABLED: bool = _b("CONTROL_PLANE_ENABLED", "1")
-    CONTROL_PLANE_STRICT_MODE: bool = _b("CONTROL_PLANE_STRICT_MODE", "0")
-    REGIME_ENGINE_ENABLED: bool = _b("REGIME_ENGINE_ENABLED", "1")
-    REGIME_LOOKBACK_BARS_M5: int = _i("REGIME_LOOKBACK_BARS_M5", "96")
-    REGIME_LOOKBACK_BARS_M15: int = _i("REGIME_LOOKBACK_BARS_M15", "64")
-    REGIME_LOOKBACK_BARS_H1: int = _i("REGIME_LOOKBACK_BARS_H1", "48")
-    REGIME_MIN_CONFIDENCE: float = _f("REGIME_MIN_CONFIDENCE", "0.55")
-    REGIME_UNCERTAIN_BEHAVIOR: RegimeUncertainBehavior = RegimeUncertainBehavior(os.environ.get("REGIME_UNCERTAIN_BEHAVIOR", "restrict"))
-    TREND_STRENGTH_THRESHOLD: float = _f("TREND_STRENGTH_THRESHOLD", "0.55")
-    ROTATION_THRESHOLD: float = _f("ROTATION_THRESHOLD", "0.55")
-    COMPRESSION_THRESHOLD: float = _f("COMPRESSION_THRESHOLD", "0.60")
-    EXPANSION_THRESHOLD: float = _f("EXPANSION_THRESHOLD", "0.60")
-    DEAD_ZONE_THRESHOLD: float = _f("DEAD_ZONE_THRESHOLD", "0.65")
-    EVENT_CHAOS_THRESHOLD: float = _f("EVENT_CHAOS_THRESHOLD", "0.65")
-    PORTFOLIO_ALLOCATOR_ENABLED: bool = _b("PORTFOLIO_ALLOCATOR_ENABLED", "1")
-    ALLOC_MAX_NEW_TRADES_PER_CYCLE: int = _i("ALLOC_MAX_NEW_TRADES_PER_CYCLE", "3")
-    ALLOC_MAX_USD_NET_EXPOSURE: float = _f("ALLOC_MAX_USD_NET_EXPOSURE", "0.06")
-    ALLOC_MAX_SINGLE_MACRO_CLUSTER_RISK: float = _f("ALLOC_MAX_SINGLE_MACRO_CLUSTER_RISK", "0.03")
-    ALLOC_MAX_CORRELATED_BUCKET_RISK: float = _f("ALLOC_MAX_CORRELATED_BUCKET_RISK", "0.03")
-    ALLOC_MAX_INSTRUMENT_DUPLICATION: int = _i("ALLOC_MAX_INSTRUMENT_DUPLICATION", "1")
-    ALLOC_MIN_PRIORITY_SCORE: float = _f("ALLOC_MIN_PRIORITY_SCORE", "0.20")
-    ALLOC_ENABLE_RESIZING: bool = _b("ALLOC_ENABLE_RESIZING", "1")
-    ALLOC_ENABLE_BLOCKING: bool = _b("ALLOC_ENABLE_BLOCKING", "1")
-    ALLOC_PRIORITY_EV_WEIGHT: float = _f("ALLOC_PRIORITY_EV_WEIGHT", "0.30")
-    ALLOC_PRIORITY_EXEC_WEIGHT: float = _f("ALLOC_PRIORITY_EXEC_WEIGHT", "0.20")
-    ALLOC_PRIORITY_EDGE_WEIGHT: float = _f("ALLOC_PRIORITY_EDGE_WEIGHT", "0.15")
-    ALLOC_PRIORITY_REGIME_WEIGHT: float = _f("ALLOC_PRIORITY_REGIME_WEIGHT", "0.20")
-    ALLOC_PRIORITY_EVENT_WEIGHT: float = _f("ALLOC_PRIORITY_EVENT_WEIGHT", "0.15")
-    CORRELATION_LOOKBACK_DAYS: int = _i("CORRELATION_LOOKBACK_DAYS", "30")
-    CORRELATION_MIN_ABS_FOR_CLUSTER: float = _f("CORRELATION_MIN_ABS_FOR_CLUSTER", "0.55")
-    CORRELATION_REFRESH_MINUTES: int = _i("CORRELATION_REFRESH_MINUTES", "30")
-    EVENT_ENGINE_ENABLED: bool = _b("EVENT_ENGINE_ENABLED", "1")
-    EVENT_CALENDAR_ENABLED: bool = _b("EVENT_CALENDAR_ENABLED", "1")
-    EVENT_PRE_LOCKOUT_MINUTES: int = _i("EVENT_PRE_LOCKOUT_MINUTES", "20")
-    EVENT_POST_DIGESTION_MINUTES: int = _i("EVENT_POST_DIGESTION_MINUTES", "25")
-    EVENT_SPREAD_NORMALIZATION_WINDOW_MINUTES: int = _i("EVENT_SPREAD_NORMALIZATION_WINDOW_MINUTES", "20")
-    EVENT_ALLOW_BREAKOUT_POST_RELEASE_ONLY: bool = _b("EVENT_ALLOW_BREAKOUT_POST_RELEASE_ONLY", "1")
-    EVENT_BLOCK_MEAN_REVERSION_NEAR_HIGH_IMPACT: bool = _b("EVENT_BLOCK_MEAN_REVERSION_NEAR_HIGH_IMPACT", "1")
-    EVENT_BLOCK_NEW_POSITIONS_IF_CALENDAR_UNAVAILABLE: bool = _b("EVENT_BLOCK_NEW_POSITIONS_IF_CALENDAR_UNAVAILABLE", "0")
-    EXECUTION_INTEL_ENABLED: bool = _b("EXECUTION_INTEL_ENABLED", "1")
-    EXECUTION_FILL_PROB_THRESHOLD: float = _f("EXECUTION_FILL_PROB_THRESHOLD", "0.35")
-    EXECUTION_MAX_EXPECTED_SLIPPAGE_BPS: float = _f("EXECUTION_MAX_EXPECTED_SLIPPAGE_BPS", "4.0")
-    EXECUTION_MAX_LATE_ENTRY_RISK: float = _f("EXECUTION_MAX_LATE_ENTRY_RISK", "0.70")
-    EXECUTION_MAX_ESCAPE_RISK: float = _f("EXECUTION_MAX_ESCAPE_RISK", "0.85")
-    EXECUTION_REPRICE_ENABLED: bool = _b("EXECUTION_REPRICE_ENABLED", "1")
-    EXECUTION_DEFAULT_MAX_RETRIES: int = _i("EXECUTION_DEFAULT_MAX_RETRIES", "2")
-    EXECUTION_DEFAULT_CANCEL_AFTER_SECONDS: int = _i("EXECUTION_DEFAULT_CANCEL_AFTER_SECONDS", "20")
-    ORDER_TACTICS_ENABLED: bool = _b("ORDER_TACTICS_ENABLED", "1")
-    TACTIC_USE_PASSIVE_LIMIT_FOR_ROTATION: bool = _b("TACTIC_USE_PASSIVE_LIMIT_FOR_ROTATION", "1")
-    TACTIC_USE_AGGRESSIVE_STOP_FOR_EXPANSION: bool = _b("TACTIC_USE_AGGRESSIVE_STOP_FOR_EXPANSION", "1")
-    TACTIC_ALLOW_STAGING: bool = _b("TACTIC_ALLOW_STAGING", "1")
-    TACTIC_MAX_CLIPS: int = _i("TACTIC_MAX_CLIPS", "3")
-    TACTIC_MIN_CLIP_SECONDS: int = _i("TACTIC_MIN_CLIP_SECONDS", "2")
-    TACTIC_FALLBACK_TO_MARKET_ALLOWED: bool = _b("TACTIC_FALLBACK_TO_MARKET_ALLOWED", "1")
-
-    def __post_init__(self) -> None:
-        for fld in [
-            "REGIME_MIN_CONFIDENCE", "TREND_STRENGTH_THRESHOLD", "ROTATION_THRESHOLD", "COMPRESSION_THRESHOLD",
-            "EXPANSION_THRESHOLD", "DEAD_ZONE_THRESHOLD", "EVENT_CHAOS_THRESHOLD", "EXECUTION_FILL_PROB_THRESHOLD",
-        ]:
-            val = getattr(self, fld)
-            if not 0 <= val <= 1.0:
-                raise ValueError(f"{fld} must be in [0,1]")
-        if self.ALLOC_MAX_NEW_TRADES_PER_CYCLE < 1:
-            raise ValueError("ALLOC_MAX_NEW_TRADES_PER_CYCLE must be >= 1")

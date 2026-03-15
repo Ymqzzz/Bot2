@@ -15,3 +15,6 @@
 - `TRADE_INTEL_CONFIG_REFERENCE.md`
 - `TRADE_INTEL_REASON_CODES.md`
 - `TRADE_INTEL_MIGRATION_NOTE.md`
+
+## Deprecation notice
+- The legacy direct orchestration path in `main.py` is now deprecated. Trade-intel candidate preparation should be invoked through the shared runtime coordinator lifecycle (`app/runtime/engine.py`).
