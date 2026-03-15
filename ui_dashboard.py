@@ -179,12 +179,23 @@ def health() -> dict[str, str]:
 def _register_aliases() -> None:
     base_paths = ["", UI_BASE_PATH] if UI_BASE_PATH else [""]
     dashboards = ["/", "/dashboard", "/ui", "/ui/dashboard"]
+    registered_paths: set[str] = set()
+
     for base in base_paths:
         for route in dashboards:
             path = f"{base}{route}" if route != "/" else (base or "/")
-            app.add_url_rule(path, endpoint=f"dashboard_{path}", view_func=dashboard)
+            if path in registered_paths:
+                continue
+            registered_paths.add(path)
+            endpoint = f"dashboard_{len(registered_paths)}"
+            app.add_url_rule(path, endpoint=endpoint, view_func=dashboard)
 
-        app.add_url_rule(f"{base}/health" if base else "/health", endpoint=f"health_{base or 'root'}", view_func=health)
+        health_path = f"{base}/health" if base else "/health"
+        if health_path in registered_paths:
+            continue
+        registered_paths.add(health_path)
+        endpoint = f"health_{len(registered_paths)}"
+        app.add_url_rule(health_path, endpoint=endpoint, view_func=health)
 
 
 _register_aliases()
