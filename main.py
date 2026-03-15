@@ -32,6 +32,10 @@ from execution_engine import ExecutionStats, choose_entry_type, clip_staging_pla
 from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
+from research_core import load_config as load_research_core_config
+from research_core.pipeline import ResearchCorePipeline
+from research_core.replay_data import load_replay_stream
+from research_core.scenarios import build_meta_scenario
 
 
 # ========= CONFIG =========
@@ -160,6 +164,80 @@ DEFAULT_SAFE_PROFILE = {
 }
 
 runtime_state_cache = {"ts": 0.0, "profiles": {}, "quantile": {}, "calibration": {}}
+research_core_pipeline = None
+
+
+def _build_research_stream_loader():
+    def _loader(start_ts, end_ts, instruments, scenario=None):
+        step_ts = [start_ts, end_ts]
+        streams = {
+            "market_intel": [{"ts": start_ts, "value": "snapshot"}],
+            "events": [{"ts": start_ts, "value": "none"}],
+            "execution": [{"ts": start_ts, "value": "trace"}],
+            "candidates": [{"ts": start_ts, "value": ["c1"]}],
+            "approved": [{"ts": start_ts, "value": ["c1"]}],
+        }
+        stream = load_replay_stream(step_ts, streams)
+        for ts in stream.steps:
+            payload = stream.aligned[ts]
+            payload["candidates"] = list((payload.get("candidates") or {}).get("value", []))
+            payload["approved"] = list((payload.get("approved") or {}).get("value", []))
+            payload["execution_outcomes"] = [{"r": 0.0}]
+        return stream
+
+    return _loader
+
+
+def initialize_research_core() -> None:
+    global research_core_pipeline
+    try:
+        cfg = load_research_core_config()
+        if not cfg.RESEARCH_CORE_ENABLED:
+            return
+        research_core_pipeline = ResearchCorePipeline(cfg, replay_loader=_build_research_stream_loader())
+    except Exception as exc:
+        logger.warning(f"research_core init failed: {exc}")
+
+
+def apply_meta_approval(candidate: dict, context: dict) -> dict:
+    if research_core_pipeline is None:
+        return {"action": "approve", "risk_multiplier": 1.0, "reason_codes": ["META_BYPASS_NOT_INITIALIZED"]}
+    decision = research_core_pipeline.meta_approve_candidate(candidate, context)
+    return {
+        "action": decision.action,
+        "risk_multiplier": decision.risk_adjustment_multiplier,
+        "delay_seconds": decision.delay_seconds,
+        "reason_codes": decision.reason_codes,
+    }
+
+
+def run_research_core_mode(mode: str, data_dir: str) -> None:
+    initialize_research_core()
+    if research_core_pipeline is None:
+        raise RuntimeError("research_core not enabled")
+    now = datetime.now(timezone.utc)
+    start_ts = now - timedelta(hours=1)
+    if mode == "replay":
+        result = research_core_pipeline.run_replay(start_ts, now, INSTRUMENTS[:2], scenario=None)
+        print(f"Replay complete: {result.replay_id}")
+        return
+    if mode == "simulate":
+        scenarios = [build_meta_scenario("meta_low_prob", {"hard_reject_low_prob": True})]
+        result = research_core_pipeline.run_simulation_set(start_ts, now, INSTRUMENTS[:2], scenarios)
+        print(f"Simulation complete: {result.simulation_id}")
+        return
+    if mode == "calibrate":
+        sample = [
+            {"strategy": "core", "raw_confidence": 0.65, "won": 1, "r_multiple": 0.8},
+            {"strategy": "core", "raw_confidence": 0.35, "won": 0, "r_multiple": -0.6},
+        ] * 30
+        snaps = research_core_pipeline.refresh_calibration(sample, force=True)
+        print(f"Calibration refreshed: {len(snaps)} snapshots")
+        return
+    if mode == "report":
+        run_research_backtest(data_dir=data_dir, out_dir=os.environ.get("RESEARCH_OUT_DIR", "research_outputs"), wf_state_path=WF_STATE_PATH)
+        return
+    raise RuntimeError("Unknown research submode. Use replay|simulate|calibrate|report")
 
 # ======== COMMENTARY CONFIG ========
 SUMMARY_EVERY_SEC = int(os.environ.get("SUMMARY_EVERY_SEC", "120"))  # default 2min
@@ -5083,12 +5161,14 @@ def run_research_backtest(data_dir, out_dir="research_outputs", wf_state_path=WF
 # ========= MAIN =========
 
 def main():
+    initialize_research_core()
     if "--research" in sys.argv:
         idx = sys.argv.index("--research")
-        data_dir = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else os.environ.get("RESEARCH_DATA_DIR", "")
-        if not data_dir:
-            raise RuntimeError("Provide data dir: python main.py --research <dir>")
-        run_research_backtest(data_dir=data_dir, out_dir=os.environ.get("RESEARCH_OUT_DIR", "research_outputs"), wf_state_path=WF_STATE_PATH)
+        mode = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "report"
+        data_dir = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else os.environ.get("RESEARCH_DATA_DIR", "")
+        if mode == "report" and not data_dir:
+            raise RuntimeError("Provide data dir: python main.py --research report <dir>")
+        run_research_core_mode(mode, data_dir)
         return
     if not all([DISCORD_TOKEN, OANDA_API_KEY, OANDA_ACCOUNTID]):
         raise RuntimeError("Missing environment variables...")
