@@ -60,6 +60,7 @@ class PositionSizer:
         cluster_risk_pct: float,
         quality_multiplier: float = 1.0,
         uncertainty_multiplier: float = 1.0,
+        strategy_health_multiplier: float = 1.0,
         strategy_multiplier: float = 1.0,
     ) -> SizingDiagnostics:
         nav_f = max(float(nav), 0.0)
@@ -83,6 +84,8 @@ class PositionSizer:
 
         risk_budget_notional = nav_f * portfolio_budget_pct
         denom = max(atr_f * 10_000.0 * dislocation_multiplier, 1e-9)
+        intelligence_multiplier = self._clamp(float(quality_multiplier) * float(uncertainty_multiplier) * float(strategy_health_multiplier), 0.2, 1.6)
+        raw_units = risk_budget_notional * confidence_multiplier * spread_multiplier * stop_volatility_multiplier * intelligence_multiplier / denom
         q_mult = self._clamp(float(quality_multiplier), 0.2, 1.8)
         u_mult = self._clamp(float(uncertainty_multiplier), 0.2, 1.0)
         s_mult = self._clamp(float(strategy_multiplier), 0.25, 1.5)

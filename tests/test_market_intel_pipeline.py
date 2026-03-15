@@ -2,6 +2,12 @@ from datetime import datetime
 
 import pytest
 
+from market_intel.pipeline import (
+    DependencyOrderedMarketIntelPipeline,
+    LegacyMarketIntelPipeline,
+    MarketIntelPipeline,
+    MarketIntelPipelineError,
+)
 from market_intel.models import MarketIntelSnapshot, SessionContext
 from market_intel.pipeline import (
     DependencyOrderedMarketIntelPipeline,
@@ -23,6 +29,11 @@ def test_to_flat_dict_flattens_dataclass_tree() -> None:
     assert flat["metadata.source"] == "unit"
 
 
+def test_pipeline_alias_points_to_dependency_ordered_runtime() -> None:
+    assert MarketIntelPipeline is DependencyOrderedMarketIntelPipeline
+    assert MarketIntelPipeline is not LegacyMarketIntelPipeline
+
+
 def test_pipeline_non_strict_failure_is_recorded() -> None:
     pipeline = MarketIntelPipeline(providers={"htf_structure": lambda *_: (_ for _ in ()).throw(ValueError("boom"))})
 
@@ -30,6 +41,7 @@ def test_pipeline_non_strict_failure_is_recorded() -> None:
 
     failed = [status for status in snapshot.provider_status if not status.ok and status.provider == "htf_structure"]
     assert failed
+    assert snapshot.metadata["pipeline_class"] == "DependencyOrderedMarketIntelPipeline"
 
 
 def test_pipeline_strict_failure_raises() -> None:

@@ -91,6 +91,10 @@ class StructureState(IntelligenceState):
     cleanliness_score: float = 0.0
     support_resistance: dict[str, list[float]] = field(default_factory=dict)
     events: list[StructureEvent] = field(default_factory=list)
+    current_phase: str = "unknown"
+    phase_confidence: float = 0.0
+    recent_phase_transition: str = "none"
+    structural_narrative: str = "insufficient_structure"
     current_phase: str = "range_rotation"
     phase_confidence: float = 0.0
     recent_phase_transition: str = "none"
@@ -106,6 +110,9 @@ class StructureState(IntelligenceState):
 class LiquidityZone:
     pool_id: str
     pool_type: str
+    level: float
+    distance: float
+    significance: float
     price_level: float
     distance_from_current_price: float
     significance_score: float
@@ -122,6 +129,12 @@ class LiquidityState(IntelligenceState):
     pressure_score: float = 0.0
     target_hypothesis: str = "none"
     nearest_zones: list[LiquidityZone] = field(default_factory=list)
+    nearest_upside_pool: str = "none"
+    nearest_downside_pool: str = "none"
+    most_significant_pool: str = "none"
+    current_liquidity_target_hypothesis: str = "none"
+    liquidity_pressure_direction: str = "neutral"
+    liquidity_context_label: str = "neutral"
     nearest_upside_pool: str = ""
     nearest_downside_pool: str = ""
     most_significant_pool: str = ""
@@ -139,6 +152,7 @@ class SweepState(IntelligenceState):
     reversal_probability: float = 0.0
     continuation_probability: float = 0.0
     rejection_strength: float = 0.0
+    breached_pool_id: str | None = None
     breached_pool_id: str = ""
     breach_depth: float = 0.0
     acceptance_strength: float = 0.0
@@ -171,6 +185,9 @@ class StrategyHealthState(IntelligenceState):
     strategy_labels: dict[str, str] = field(default_factory=dict)
     throttle_multipliers: dict[str, float] = field(default_factory=dict)
     disable_flags: dict[str, bool] = field(default_factory=dict)
+    sample_quality_scores: dict[str, float] = field(default_factory=dict)
+    rank_penalties: dict[str, float] = field(default_factory=dict)
+    size_penalties: dict[str, float] = field(default_factory=dict)
     health_details: dict[str, dict[str, float | str | bool]] = field(default_factory=dict)
 
 
@@ -192,6 +209,12 @@ class TradeQualityState(IntelligenceState):
     quality_label: str = "low"
     size_multiplier: float = 0.5
     contributions: dict[str, float] = field(default_factory=dict)
+    alignment_score: float = 0.0
+    context_penalty_score: float = 0.0
+    execution_burden_score: float = 0.0
+    size_multiplier_hint: float = 0.5
+    positive_factors: list[str] = field(default_factory=list)
+    negative_factors: list[str] = field(default_factory=list)
     trade_quality_score: float = 0.0
     setup_cleanliness_score: float = 0.0
     alignment_score: float = 0.0
@@ -229,6 +252,17 @@ class AnalogSimilarityState(IntelligenceState):
     historical_mae_median: float = 0.0
     historical_mfe_median: float = 0.0
     insufficient_history_flag: bool = False
+
+
+@dataclass(frozen=True)
+class UncertaintyState(IntelligenceState):
+    uncertainty_score: float = 0.0
+    uncertainty_label: str = "low"
+    uncertainty_drivers: dict[str, float] = field(default_factory=dict)
+    confidence_adjustment: float = 0.0
+    size_penalty_multiplier: float = 1.0
+    ranking_penalty: float = 0.0
+    block_if_extreme_flag: bool = False
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,7 @@ class MarketIntelPipelineError(RuntimeError):
 
 
 class LegacyMarketIntelPipeline:
+    """Legacy snapshot builder kept for compatibility/testing of old storage contract."""
     """Legacy snapshot builder retained for compatibility tests and migrations."""
 @dataclass(frozen=True)
 class DependencySpec:
@@ -177,6 +178,11 @@ class DependencyOrderedMarketIntelPipeline:
             "session": SessionContext(instrument=instrument, asof=asof),
             "provider_status": [],
             "features": [],
+            "metadata": {
+                "build_started_at": datetime.utcnow().isoformat(),
+                "strict_mode": strict_mode,
+                "pipeline_class": self.__class__.__name__,
+            },
             "metadata": {"build_started_at": datetime.utcnow().isoformat(), "strict_mode": strict_mode},
         }
 
@@ -241,6 +247,8 @@ class DependencyOrderedMarketIntelPipeline:
 MarketIntelPipeline = DependencyOrderedMarketIntelPipeline
 
 __all__ = [
+    "DependencyOrderedMarketIntelPipeline",
+    "LegacyMarketIntelPipeline",
     "LegacyMarketIntelPipeline",
     "DependencyOrderedMarketIntelPipeline",
     "MarketIntelPipeline",

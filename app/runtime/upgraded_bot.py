@@ -193,6 +193,31 @@ class UpgradedBot:
             best = choose_best_candidate(cands, pwin_map, intelligence_modifiers=quality_modifiers)
             if best is None:
                 continue
+
+            intel_snapshot = self.intelligence.build_snapshot(
+                instrument=instrument,
+                bars=bars,
+                features={**feats, "spread_percentile": spread_pctile, "atr_percentile": float(feats.get("atr", 0.5))},
+                context={
+                    "trace_id": trace,
+                    "near_event": near_event,
+                    "minutes_to_event": 30.0 if near_event else 9999.0,
+                    "minutes_since_event": 9999.0,
+                    "event_severity": 0.8 if near_event else 0.0,
+                    "event_relevance": 0.8 if near_event else 0.0,
+                    "slippage_percentile": 0.25,
+                    "execution_cost": spread_pctile / 100.0,
+                    "strategy_performance": {},
+                    "cross_asset": {},
+                    "analog_history": [],
+                },
+                candidate_strategy=best.strategy,
+                raw_confidence=best.score,
+            )
+            refined_score = intel_snapshot.calibration.calibrated_confidence
+            refined_score *= (0.75 + 0.25 * intel_snapshot.trade_quality.quality_score)
+            refined_score *= (1.0 - 0.25 * intel_snapshot.uncertainty.ranking_penalty)
+            best.score = max(0.0, min(1.0, refined_score))
             best_idx = cands.index(best)
             intel_snapshot = intel_by_idx[best_idx]
             best.score = intel_snapshot.calibration.calibrated_confidence
@@ -214,6 +239,7 @@ class UpgradedBot:
                 cluster_risk_pct=self.settings.cluster_risk_cap,
                 quality_multiplier=intel_snapshot.trade_quality.size_multiplier_hint,
                 uncertainty_multiplier=intel_snapshot.uncertainty.size_penalty_multiplier,
+                strategy_health_multiplier=intel_snapshot.strategy_health.throttle_multipliers.get(best.strategy, 1.0),
                 strategy_multiplier=intel_snapshot.strategy_health.throttle_multipliers.get(best.strategy, 1.0),
             )
             if sizing.signed_units == 0:

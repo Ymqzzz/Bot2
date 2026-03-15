@@ -6,7 +6,7 @@ from app.intelligence.orchestrator import IntelligenceOrchestrator
 def _bars_trend(n: int = 180):
     out = []
     px = 1.10
-    for i in range(n):
+    for _ in range(n):
         px += 0.0003
         out.append({"open": px - 0.0001, "high": px + 0.00025, "low": px - 0.0002, "close": px})
     return out
@@ -54,12 +54,23 @@ def test_orchestrator_builds_snapshot_with_all_states() -> None:
         "slippage_percentile": 0.2,
         "execution_cost": 0.15,
         "strategy_performance": {
-            "trend": {"sample_size": 60, "win_rate": 0.62, "expectancy": 0.22, "drawdown": 0.18}
+            "trend": {"sample_size": 60, "win_rate": 0.62, "expectancy": 0.22, "drawdown": 0.18, "payoff_ratio": 1.6}
         },
         "cross_asset": {"dxy_change": -0.002, "rates_change": 0.001, "risk_on": 0.4},
         "analog_history": [
-            {"alignment": 0.8, "health": 0.75, "event": 0.1, "regime": "breakout_environment", "outcome": 1.4, "strategy": "trend"},
-            {"alignment": 0.7, "health": 0.65, "event": 0.2, "regime": "trend", "outcome": 0.9, "strategy": "trend"},
+            {
+                "alignment": 0.8,
+                "health": 0.75,
+                "event": 0.1,
+                "quality": 0.72,
+                "regime": "breakout_environment",
+                "structure_phase": "expansion_leg",
+                "liquidity_context": "high_signal",
+                "sweep_type": "external_sweep_acceptance",
+                "outcome": 1.4,
+                "strategy": "trend",
+            },
+            {"alignment": 0.7, "health": 0.65, "event": 0.2, "quality": 0.6, "regime": "trend", "outcome": 0.9, "strategy": "trend"},
         ],
         "trace_id": "trace-test-1",
     }
@@ -74,18 +85,12 @@ def test_orchestrator_builds_snapshot_with_all_states() -> None:
         timestamp=datetime(2026, 1, 1),
     )
 
-    assert snap.regime is not None
-    assert snap.mtf_bias is not None
-    assert snap.structure is not None
-    assert snap.liquidity is not None
-    assert snap.sweep is not None
-    assert snap.event_risk is not None
-    assert snap.instrument_health is not None
-    assert snap.strategy_health is not None
-    assert snap.cross_asset is not None
+    assert snap.uncertainty is not None
     assert snap.trade_quality is not None
-    assert snap.analog is not None
-    assert snap.calibration is not None
+    assert snap.trade_quality.alignment_score >= 0
+    assert snap.liquidity.most_significant_pool != "none"
+    assert snap.structure.current_phase != "unknown"
+    assert 0.0 <= snap.uncertainty.uncertainty_score <= 1.0
     assert 0.0 <= snap.trade_quality.quality_score <= 1.0
     assert 0.0 <= snap.calibration.calibrated_confidence <= 1.0
 
@@ -106,4 +111,6 @@ def test_orchestrator_degrades_with_missing_cross_asset_and_history() -> None:
 
     assert snap.cross_asset.confirmation_label == "missing"
     assert snap.analog.comparable_cases == 0
+    assert snap.analog.insufficient_history_flag
+    assert snap.uncertainty.uncertainty_score > 0.0
     assert snap.calibration.calibration_bucket in {"penalized", "neutral", "boosted"}
