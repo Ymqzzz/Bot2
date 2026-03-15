@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import time
 
 from app.config.settings import BotSettings
+from app.data.quality import validate_bars_quality
 from app.config.validation import validate_settings
 from app.features.price_features import compute_price_features
 from app.governance.decision_graph import DecisionGraph
@@ -81,6 +82,32 @@ class UpgradedBot:
             if len(bars) < 40:
                 continue
             spread_pctile = market_data.get_spread_pctile(instrument)
+            quality = validate_bars_quality(instrument=instrument, bars=bars, spread_pctile=spread_pctile)
+            trace = self.events.new_trace()
+            if quality.status == "blocked":
+                self.events.emit(
+                    "data_quality_block",
+                    trace,
+                    {
+                        "instrument": instrument,
+                        "failing_rules": quality.failing_rules,
+                        "reason_codes": quality.reason_codes,
+                    },
+                )
+                continue
+            if quality.status == "degraded":
+                self.events.emit(
+                    "data_quality_degraded",
+                    trace,
+                    {
+                        "instrument": instrument,
+                        "failing_rules": quality.failing_rules,
+                        "reason_codes": quality.reason_codes,
+                    },
+                )
+            else:
+                self.events.emit("data_quality_pass", trace, {"instrument": instrument, "failing_rules": []})
+
             liq = market_data.get_liquidity_factor(instrument)
             near_event = market_data.has_near_event(instrument)
             disloc = dislocation_score(bars, spread_pctile)
@@ -143,6 +170,8 @@ class UpgradedBot:
             )
             decision["regime"] = regime
             decision["dislocation"] = disloc
+            decision["data_quality_status"] = quality.status
+            decision["data_quality_reason_codes"] = quality.reason_codes
             if decision.get("approved"):
                 self._last_trade_ts = now
                 self.gov_state.trades_today += 1
