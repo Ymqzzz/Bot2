@@ -15,6 +15,7 @@ from app.monitoring.audit import AuditSink
 from app.monitoring.events import EventBus
 from app.risk.governors import GovernorState, RiskGovernor
 from app.risk.portfolio_adapter import PortfolioContext
+from app.risk.sizing import PositionSizer
 from app.risk.tail_risk import dislocation_score
 from app.strategy.registry import StrategyRegistry
 from app.strategy.plugins.breakout_plugin import BreakoutPlugin
@@ -43,6 +44,7 @@ class UpgradedBot:
         self.kill_switch = KillSwitch()
         self.risk_governor = RiskGovernor(max_trades=50)
         self.calibrator = ScoreCalibrator()
+        self.sizer = PositionSizer()
         self.gov_state = GovernorState()
         self._last_trade_ts = 0.0
 
@@ -54,9 +56,9 @@ class UpgradedBot:
             return "calm"
         return "normal"
 
-    def build_candidates(self, instrument: str, bars: list[dict]) -> list:
+    def build_candidates(self, instrument: str, bars: list[dict]) -> tuple[list, dict]:
         feats = compute_price_features(bars)
-        return self.registry.generate_candidates(instrument, bars, feats)
+        return self.registry.generate_candidates(instrument, bars, feats), feats
 
     def run_cycle(self, market_data, broker_ctx: BrokerContext) -> list[dict]:
         active, reason = self.kill_switch.status()
@@ -91,7 +93,7 @@ class UpgradedBot:
                 self.events.emit("signal_rejected", trace, {"instrument": instrument, "reason": reason, "dislocation": disloc})
                 continue
 
-            cands = self.build_candidates(instrument, bars)
+            cands, feats = self.build_candidates(instrument, bars)
             regime = self._regime(bars)
             pwin_map = {i: self.calibrator.calibrate(c.score, regime=regime) for i, c in enumerate(cands)}
             best = choose_best_candidate(cands, pwin_map)
@@ -101,7 +103,23 @@ class UpgradedBot:
             now = time.time()
             if now - self._last_trade_ts < self.settings.min_trade_interval_sec:
                 continue
-            signed_units = 1 if best.side == "BUY" else -1
+            sizing = self.sizer.compute_units(
+                side=best.side,
+                nav=broker_ctx.nav,
+                entry_price=best.entry_price,
+                stop_loss=best.stop_loss,
+                atr=float(feats.get("atr", 0.0)),
+                dislocation=disloc,
+                spread_pctile=spread_pctile,
+                confidence=best.score,
+                open_positions=broker_ctx.open_positions,
+                daily_risk_pct=self.settings.risk_budget_daily,
+                cluster_risk_pct=self.settings.cluster_risk_cap,
+            )
+            if sizing.signed_units == 0:
+                trace = self.events.new_trace()
+                self.events.emit("signal_rejected", trace, {"instrument": instrument, "reason": "size_zero", "sizing": sizing.to_dict()})
+                continue
             trace = self.events.new_trace()
             decision = self.decision_graph.evaluate(
                 trace_id=trace,
@@ -109,7 +127,8 @@ class UpgradedBot:
                 spread_pctile=spread_pctile,
                 liquidity_factor=liq,
                 has_near_event=near_event,
-                signed_units=signed_units,
+                signed_units=sizing.signed_units,
+                sizing_diagnostics=sizing.to_dict(),
                 portfolio_ctx=PortfolioContext(
                     open_positions=broker_ctx.open_positions,
                     nav=broker_ctx.nav,

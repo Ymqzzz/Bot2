@@ -31,6 +31,9 @@ def test_upgraded_bot_generates_approved_decision():
 
     assert decisions
     assert any(d.get("approved") for d in decisions)
+    approved = next(d for d in decisions if d.get("approved"))
+    assert "sizing" in approved
+    assert approved["proposal"]["signed_units"] != 0
     assert bot.events.events
 
 
