@@ -10,12 +10,18 @@ def candidate_expectancy_proxy(c: SignalCandidate, calibrated_pwin: float) -> fl
     return calibrated_pwin * rr - (1.0 - calibrated_pwin)
 
 
-def choose_best_candidate(candidates: list[SignalCandidate], pwin_map: dict[int, float]) -> SignalCandidate | None:
+def choose_best_candidate(
+    candidates: list[SignalCandidate],
+    pwin_map: dict[int, float],
+    intelligence_modifiers: dict[int, float] | None = None,
+) -> SignalCandidate | None:
     if not candidates:
         return None
+    modifiers = intelligence_modifiers or {}
     scored = []
     for idx, c in enumerate(candidates):
         p = float(pwin_map.get(idx, 0.5))
-        scored.append((candidate_expectancy_proxy(c, p), c))
+        quality_adj = float(modifiers.get(idx, 1.0))
+        scored.append((candidate_expectancy_proxy(c, p) * quality_adj, c))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[0][1]
