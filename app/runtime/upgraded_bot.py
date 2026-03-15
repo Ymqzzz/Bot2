@@ -30,6 +30,9 @@ class BrokerContext:
     nav: float
     open_positions: list[dict]
     corr_matrix: dict
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    equity_now: float = 0.0
 
 
 class UpgradedBot:
@@ -51,6 +54,31 @@ class UpgradedBot:
         self.gov_state = GovernorState()
         self._last_trade_ts = 0.0
 
+    def _refresh_governor_state(self, broker_ctx: BrokerContext) -> dict[str, float]:
+        state = self.gov_state
+        state.realized_pnl = broker_ctx.realized_pnl
+        state.unrealized_pnl = broker_ctx.unrealized_pnl
+        state.equity_now = broker_ctx.equity_now if broker_ctx.equity_now > 0 else broker_ctx.nav
+        if state.equity_peak <= 0:
+            state.equity_peak = state.equity_now
+        else:
+            state.equity_peak = max(state.equity_peak, state.equity_now)
+        if state.equity_peak > 0:
+            state.intraday_drawdown_pct = max(0.0, (state.equity_peak - state.equity_now) / state.equity_peak)
+        else:
+            state.intraday_drawdown_pct = 0.0
+        state.loss_streak = state.loss_streak + 1 if state.daily_pnl < 0 else 0
+        return {
+            "realized_pnl": state.realized_pnl,
+            "unrealized_pnl": state.unrealized_pnl,
+            "daily_pnl": state.daily_pnl,
+            "equity_now": state.equity_now,
+            "equity_peak": state.equity_peak,
+            "current_drawdown_pct": state.intraday_drawdown_pct,
+            "loss_streak": state.loss_streak,
+            "trades_today": state.trades_today,
+        }
+
     def _regime(self, bars: list[dict]) -> str:
         d = dislocation_score(bars, 50.0)
         if d > 1.6:
@@ -70,10 +98,20 @@ class UpgradedBot:
             self.events.emit("signal_rejected", trace, {"reason": f"kill_switch:{reason}"})
             return []
 
-        ok, why = self.risk_governor.check(self.gov_state, nav=broker_ctx.nav)
+        state_snapshot = self._refresh_governor_state(broker_ctx)
+        trace = self.events.new_trace()
+        self.events.emit("risk_state_updated", trace, state_snapshot)
+
+        ok, why, metrics = self.risk_governor.check(self.gov_state, nav=broker_ctx.nav)
         if not ok:
-            trace = self.events.new_trace()
-            self.events.emit("risk_blocked", trace, {"reason": why})
+            block_payload = {
+                "reason": why,
+                "current_drawdown_pct": metrics["current_drawdown_pct"],
+                "loss_budget_usage_pct": metrics["loss_budget_usage_pct"],
+                "loss_budget": metrics["loss_budget"],
+                "loss_used": metrics["loss_used"],
+            }
+            self.events.emit("risk_blocked", trace, block_payload)
             return []
 
         decisions = []
