@@ -29,12 +29,36 @@ class ExecutionStats:
         }
 
 
-def choose_entry_type(strategy: str, breakout_mag: float, liquidity_factor: float, spread_pctile: float) -> str:
-    """Select an entry type balancing momentum intent and current market frictions."""
-    is_breakout = "breakout" in strategy.lower()
-    if is_breakout and breakout_mag > 0.35 and liquidity_factor > 0.55:
+def choose_entry_type(
+    strategy: str,
+    breakout_mag: float,
+    liquidity_factor: float,
+    spread_pctile: float,
+    velocity: float = 0.0,
+    depth_pressure: float = 0.0,
+    profile_acceptance: float = 0.5,
+    spread_shock: bool = False,
+) -> str:
+    """Select STOP/LIMIT/MARKET based on momentum, depth pressure, profile context, and spread regime."""
+    strategy_key = strategy.lower()
+    is_breakout = "breakout" in strategy_key
+    is_reversion = "mean" in strategy_key or "reversion" in strategy_key or "sweep" in strategy_key
+
+    strong_momentum = max(abs(breakout_mag), abs(velocity)) >= 0.5
+    strong_depth_pressure = abs(depth_pressure) > 0.45
+    poor_execution = liquidity_factor < 0.45
+
+    if spread_shock or spread_pctile > 92:
+        return "LIMIT"
+    if is_breakout and strong_momentum and (strong_depth_pressure or depth_pressure == 0.0) and not poor_execution:
         return "STOP"
+    if is_reversion and profile_acceptance < 0.35:
+        return "LIMIT"
     if spread_pctile > 80 and not is_breakout:
+        return "LIMIT"
+    if strong_momentum and not poor_execution:
+        return "MARKET"
+    if poor_execution or profile_acceptance < 0.4:
         return "LIMIT"
     return "MARKET"
 
