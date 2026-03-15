@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Callable, Dict, List, Mapping, Optional
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from .models import MarketIntelSnapshot, ProviderStatus, SessionContext
 from .storage import SnapshotStorage
@@ -14,9 +13,6 @@ class MarketIntelPipelineError(RuntimeError):
     pass
 
 
-class LegacyMarketIntelPipeline:
-    """Legacy snapshot builder kept for compatibility/testing of old storage contract."""
-    """Legacy snapshot builder retained for compatibility tests and migrations."""
 @dataclass(frozen=True)
 class DependencySpec:
     name: str
@@ -25,8 +21,12 @@ class DependencySpec:
     strict_default: bool = False
 
 
-class MarketIntelPipeline:
-    """Market intel pipeline supporting both snapshot modes used in the repo/tests."""
+class LegacyMarketIntelPipeline:
+    """Legacy snapshot builder retained for compatibility tests and migrations."""
+
+
+class DependencyOrderedMarketIntelPipeline:
+    """Pipeline that supports both legacy storage snapshots and provider snapshots."""
 
     DEPENDENCY_ORDER: List[DependencySpec] = [
         DependencySpec("htf_structure", "htf_structure", "htf_structure"),
@@ -59,12 +59,6 @@ class MarketIntelPipeline:
         close = float(bars[-1].get("close", 0.0)) if bars else 0.0
         volume = float(sum(float(b.get("volume", 0.0) or 0.0) for b in bars)) if bars else 0.0
         return {"bar_count": len(bars), "tick_count": len(ticks), "close": close, "volume": volume}
-        return {
-            "bar_count": len(bars),
-            "tick_count": len(ticks),
-            "close": close,
-            "volume": volume,
-        }
 
     @staticmethod
     def _default_quality_builder(provider_statuses: dict[str, Any] | None = None, **_: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -136,34 +130,6 @@ class MarketIntelPipeline:
             )
         return snapshot
 
-
-@dataclass(frozen=True)
-class DependencySpec:
-    name: str
-    field: str
-    provider_key: str
-    strict_default: bool = False
-
-
-class DependencyOrderedMarketIntelPipeline:
-    """Builds a market intelligence snapshot with ordered dependencies."""
-
-    DEPENDENCY_ORDER: List[DependencySpec] = [
-        DependencySpec("htf_structure", "htf_structure", "htf_structure"),
-        DependencySpec("volume_profile", "volume_profile", "volume_profile"),
-        DependencySpec("liquidity_map", "liquidity_map", "liquidity_map"),
-        DependencySpec("orderbook_proxy", "orderbook_proxy", "orderbook_proxy"),
-        DependencySpec("gamma_proxy", "gamma_proxy", "gamma_proxy"),
-        DependencySpec("microstructure", "microstructure", "microstructure"),
-        DependencySpec("cross_asset", "cross_asset", "cross_asset"),
-        DependencySpec("execution_quality", "execution_quality", "execution_quality"),
-        DependencySpec("features", "features", "features"),
-    ]
-
-    def __init__(self, providers: Optional[Mapping[str, Callable[[str, datetime, dict], Any]]] = None) -> None:
-        self.providers: Dict[str, Callable[[str, datetime, dict], Any]] = dict(providers or {})
-
-    def build_snapshot(self, instrument: str, asof: datetime, runtime_context: Optional[dict] = None) -> MarketIntelSnapshot:
     def _build_provider_snapshot(
         self,
         instrument: str,
@@ -183,7 +149,6 @@ class DependencyOrderedMarketIntelPipeline:
                 "strict_mode": strict_mode,
                 "pipeline_class": self.__class__.__name__,
             },
-            "metadata": {"build_started_at": datetime.utcnow().isoformat(), "strict_mode": strict_mode},
         }
 
         for dep in self.DEPENDENCY_ORDER:
@@ -249,8 +214,6 @@ MarketIntelPipeline = DependencyOrderedMarketIntelPipeline
 __all__ = [
     "DependencyOrderedMarketIntelPipeline",
     "LegacyMarketIntelPipeline",
-    "LegacyMarketIntelPipeline",
-    "DependencyOrderedMarketIntelPipeline",
     "MarketIntelPipeline",
     "MarketIntelPipelineError",
 ]
