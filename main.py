@@ -34,6 +34,8 @@ from execution_engine import ExecutionStats, choose_entry_type, clip_staging_pla
 from edge_health import EdgeHealthMonitor
 from world_state import session_playbook
 from reporting import write_eod_report
+from trade_intel import load_config as load_trade_intel_config
+from trade_intel.pipeline import build_default_pipeline
 from control_plane import load_config as load_control_plane_config, ControlPlanePipeline
 from research_core import load_config as load_research_core_config
 from research_core.pipeline import ResearchCorePipeline
@@ -364,6 +366,7 @@ director_state = {"ts": 0.0, "decision": None, "cache": {}}
 openrouter_state = {"last_call": 0.0, "cache": {}}
 execution_stats = ExecutionStats(maxlen=200)
 edge_monitor = EdgeHealthMonitor()
+trade_intel_pipeline = build_default_pipeline(load_trade_intel_config())
 portfolio_limits = PortfolioLimits(max_net_ccy_exposure_pct=MAX_NET_CCY_EXPOSURE_PCT, max_gross_ccy_exposure_pct=MAX_GROSS_CCY_EXPOSURE_PCT, daily_risk_pct=DAILY_RISK_PCT, max_cluster_risk_pct=CLUSTER_HEAT_LIMIT)
 ops_state = {"session_day": None, "last_session": None, "playbook": {}}
 daily_trade_budget = {
@@ -1335,6 +1338,39 @@ def manage_active_trades(instr, sl_buffer=0.04):
         meta = trade_entry_meta.setdefault(tid, {"ts": time.time(), "be_moved": False, "partial_taken": False, "time_stop_bars": TIME_STOP_BARS})
         bars_open = (time.time() - meta["ts"]) / max(COOLDOWN_SEC, 1)
         time_stop_bars = int(meta.get("time_stop_bars", TIME_STOP_BARS) or TIME_STOP_BARS)
+
+        intel_tid = meta.get("trade_intel_id")
+        if intel_tid:
+            ti_update = trade_intel_pipeline.on_trade_update(
+                {
+                    "trade_id": intel_tid,
+                    "r_multiple": float(r_mult),
+                    "seconds_held": int(time.time() - meta.get("ts", time.time())),
+                    "structure_confirmed": bool(abs(flip_score) < 0.75),
+                },
+                {
+                    "execution_risk_score": float(np.clip((spread_cache.get(instr, 0.0) or 0.0) * 10000.0 / 5.0, 0.0, 1.0)),
+                    "regime_alignment_score": 0.1 if ((side > 0 and h1_vote < 0) or (side < 0 and h1_vote > 0)) else 0.8 if abs(h1_vote) > 0 else 0.5,
+                    "near_profile_level": bool(abs(r_mult) > 1.0),
+                },
+            )
+            action = ((ti_update or {}).get("instruction") or {}).get("action")
+            if action == "take_partial" and (not meta.get("partial_taken")):
+                cut_units = -int(math.copysign(max(1, int(units_abs * PARTIAL_CLOSE_FRACTION)), side))
+                place_market_order(instr, cut_units)
+                meta["partial_taken"] = True
+                trade_intel_pipeline.on_trade_partial({"trade_id": intel_tid}, {"cut_units": cut_units}, {"instrument": instr})
+            elif action == "arm_break_even" and (not meta.get("be_moved")) and t.get("stopLossOrder", {}).get("id"):
+                new_sl = ep + sl_buffer * risk_per_unit if side > 0 else ep - sl_buffer * risk_per_unit
+                safe_put(
+                    f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders/{t['stopLossOrder']['id']}",
+                    json_data={"order": {"price": f"{_round_price(instr, new_sl)}"}},
+                )
+                meta["be_moved"] = True
+            elif action == "force_exit":
+                place_market_order(instr, -side)
+                log_event("MANAGE", instr, f"{tid}: trade-intel force exit", {"r": r_mult}, level=1)
+                continue
 
         if (not meta["be_moved"]) and r_mult >= 1.0 and t.get("stopLossOrder", {}).get("id"):
             new_sl = ep + sl_buffer * risk_per_unit if side > 0 else ep - sl_buffer * risk_per_unit
@@ -3089,7 +3125,7 @@ def place_limit_entry_order(instr, units, price, tp=None, sl=None):
     return safe_post(f"{HOST}/accounts/{OANDA_ACCOUNTID}/orders", json_data=order)
 
 
-def risk_approve_and_size(plan, snapshot):
+def risk_approve_and_size(plan, snapshot, trade_prep=None):
     nav, _ = get_nav()
     heat = current_portfolio_heat(nav)
     if heat >= PORTFOLIO_HEAT_LIMIT:
@@ -3107,6 +3143,12 @@ def risk_approve_and_size(plan, snapshot):
     regime_mult = 0.6 if snapshot["mode"] == "high_vol" else 1.0
     corr_pen = max(0.4, 1.0 - min(0.6, cluster * 10.0))
     units = int(units * conf_mult * regime_mult * corr_pen * snapshot.get("risk_mult", 1.0))
+    intel_mult = 1.0
+    if trade_prep and getattr(trade_prep.get("sizing_decision"), "recommended_risk_fraction", None) is not None:
+        sd = trade_prep["sizing_decision"]
+        base_rf = max(float(getattr(sd, "base_risk_fraction", ACCOUNT_RISK_PCT)), 1e-9)
+        intel_mult = float(getattr(sd, "recommended_risk_fraction", base_rf)) / base_rf
+        units = int(units * intel_mult)
     units = realized_vol_target(units, snapshot["dfs"]["M5"])
     if units == 0:
         return None, {"blocked": "units_zero"}
@@ -3129,7 +3171,7 @@ def risk_approve_and_size(plan, snapshot):
     plan2["units"] = units
     plan2["risk_cost"] = assessed.get("risk_cost", 0.0)
     plan2["correlation_cluster_id"] = assessed.get("correlation_cluster_id", "OTHER")
-    plan2["risk_diag"] = {"heat": heat, "cluster": cluster, "conf_mult": conf_mult, "regime_mult": regime_mult, "corr_pen": corr_pen, "risk_cost": plan2["risk_cost"]}
+    plan2["risk_diag"] = {"heat": heat, "cluster": cluster, "conf_mult": conf_mult, "regime_mult": regime_mult, "corr_pen": corr_pen, "intel_mult": intel_mult, "risk_cost": plan2["risk_cost"]}
     return plan2, plan2["risk_diag"]
 
 
@@ -3211,6 +3253,41 @@ def update_strategy_performance_from_fills():
             log_event("RISK", instr, f"Edge decay kill-switch for {strat}", edge_diag, level=1)
         fill_px = float(t.get("price", plan.get("entry_price", 0.0)) or 0.0)
         execution_stats.record_fill(instr, float(spread_cache.get(instr, 0.0) or 0.0), float(plan.get("entry_price", fill_px) or fill_px), fill_px)
+        intel_tid = plan.get("trade_intel_id")
+        if intel_tid:
+            closed_meta = (t.get("tradesClosed") or [{}])[0]
+            closed_id = str(closed_meta.get("tradeID", ""))
+            opened_ts = float((trade_entry_meta.get(closed_id, {}) or {}).get("ts", time.time()))
+            seconds_held = int(time.time() - opened_ts)
+            close_info = {
+                "realized_pnl": pl,
+                "realized_r": r,
+                "bars_held": int(seconds_held / max(COOLDOWN_SEC, 1)),
+                "seconds_held": seconds_held,
+                "pnl_path": [pl],
+                "spread_scores": [float(spread_cache.get(instr, 0.0) or 0.0)],
+                "vol_scores": [float(plan.get("risk_diag", {}).get("regime_mult", 1.0))],
+                "exit_at_structure": False,
+                "exit_at_profile": False,
+                "due_to_time_stop": False,
+                "due_to_trailing": False,
+                "due_to_execution_dislocation": False,
+            }
+            market_ctx = {
+                "spread_bps": float(spread_cache.get(instr, 0.0) or 0.0) * 10000.0,
+                "distance_struct_bps": 8.0,
+                "distance_profile_bps": 8.0,
+                "adverse_selection_score": 0.0,
+                "move_spent_fraction": 0.4,
+                "event_state": "blocked" if event_guardrails(instr) else "normal",
+                "execution_regime": "normal",
+                "regime_mismatch": False,
+                "structure_context": "na",
+                "profile_context": "na",
+                "trigger_family": "runtime",
+            }
+            trade_intel_pipeline.on_trade_close({"trade_id": intel_tid}, close_info, market_ctx)
+
         s = strategy_stats[strat]
         s["n"] += 1
         if pl > 0:
@@ -4371,10 +4448,52 @@ async def trade_once(instr, director_item=None, world_state=None):
             log_event("DECISION", instr, "No eligible trade plan", {"regime": snapshot["regime"], "control_plane": cp_diag}, level=1)
             return
 
-        approved_plan, risk_diag = risk_approve_and_size(plan, snapshot)
+        prep_candidate = {
+            "trade_id": plan_id(plan),
+            "instrument": plan["instrument"],
+            "strategy_name": plan["strategy"],
+            "setup_type": plan["strategy"],
+            "side": plan["side"],
+            "entry_price": plan["entry_price"],
+            "stop_loss": plan["stop_loss"],
+            "take_profit": plan["take_profit"],
+            "order_type": plan["order_type"],
+            "confidence": plan.get("confidence", 0.5),
+            "ev_r": plan.get("ev_r", 0.0),
+            "rr": plan.get("rr", 0.0),
+            "intel_quality_score": float(plan.get("confidence", 0.5)),
+            "entry_precision_score": 0.5,
+            "execution_feasibility_score": float(np.clip(1.0 - snapshot.get("spread_info", {}).get("percentile", 50.0) / 100.0, 0.0, 1.0)),
+            "regime_alignment_score": 0.2 if snapshot.get("mode") == "high_vol" else 0.8,
+        }
+        prep_market = {
+            "execution_risk_score": float(np.clip(snapshot.get("spread_info", {}).get("percentile", 50.0) / 100.0, 0.0, 1.0)),
+            "event_risk": bool(snapshot.get("event_block", False)),
+            "spread_expensive": bool(snapshot.get("spread_block", False)),
+        }
+        prep_portfolio = {
+            "available_risk_score": float(np.clip(1.0 - current_portfolio_heat(nav) / max(PORTFOLIO_HEAT_LIMIT, 1e-9), 0.0, 1.0)),
+        }
+        prep_runtime = {
+            "session_name": session_name,
+            "regime_name": snapshot.get("regime", "unknown"),
+            "spread_regime": "wide" if snapshot.get("spread_block") else "normal",
+            "recent_performance": {
+                "session_edge_score": 0.4 if daily_trade_budget.get("consecutive_losses", 0) >= 3 else 0.7,
+                "recent_performance_score": 0.4 if daily_trade_budget.get("consecutive_losses", 0) >= 2 else 0.6,
+            },
+        }
+        trade_prep = trade_intel_pipeline.prepare_trade(prep_candidate, prep_market, prep_portfolio, prep_runtime)
+        if trade_prep.get("block_trade"):
+            log_event("RISK", instr, "Trade intel blocked plan", {"reason_codes": trade_prep.get("reason_codes", [])}, level=1)
+            return
+
+        approved_plan, risk_diag = risk_approve_and_size(plan, snapshot, trade_prep=trade_prep)
         if not approved_plan:
             log_event("RISK", instr, "Plan blocked by portfolio risk", risk_diag, level=1)
             return
+        approved_plan["trade_intel_id"] = trade_prep.get("trade_id")
+        approved_plan["trade_intel_exit_plan"] = getattr(trade_prep.get("exit_plan"), "to_flat_dict", lambda: {})()
 
         pid = plan_id(approved_plan)
         if plan_seen_recently(pid):
@@ -4401,7 +4520,14 @@ async def trade_once(instr, director_item=None, world_state=None):
                 "be_moved": False,
                 "partial_taken": False,
                 "time_stop_bars": approved_plan.get("time_stop_bars", TIME_STOP_BARS),
+                "trade_intel_id": approved_plan.get("trade_intel_id"),
+                "trade_intel_exit_plan": approved_plan.get("trade_intel_exit_plan", {}),
             }
+            if approved_plan.get("trade_intel_id"):
+                trade_intel_pipeline.on_trade_open({"trade_id": approved_plan.get("trade_intel_id"), "entry_filled": float(fill.get("price", approved_plan.get("entry_price", 0.0)) or 0.0)}, {
+                    "session_name": session_name,
+                    "regime_name": snapshot.get("regime", "unknown"),
+                })
 
         log_event("ORDER", instr, "Executed plan", {"strategy": approved_plan["strategy"], "type": approved_plan["order_type"], "units": approved_plan["units"], **exec_diag, **risk_diag, "session": session_name}, level=1)
         replay_log({"ts": utc_now_iso(), "type": "execution", "instrument": instr, "plan": approved_plan, "exec": exec_diag})
