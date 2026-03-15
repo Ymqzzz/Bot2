@@ -13,6 +13,7 @@ from app.models.calibration import ScoreCalibrator
 from app.models.ensemble import choose_best_candidate
 from app.monitoring.audit import AuditSink
 from app.monitoring.events import EventBus
+from app.monitoring.repository import create_event_repository
 from app.risk.governors import GovernorState, RiskGovernor
 from app.risk.portfolio_adapter import PortfolioContext
 from app.risk.tail_risk import dislocation_score
@@ -37,7 +38,8 @@ class UpgradedBot:
         self.registry.register(TrendPlugin())
         self.registry.register(MeanReversionPlugin())
         self.registry.register(BreakoutPlugin())
-        self.events = EventBus()
+        event_repo = create_event_repository(self.settings.monitoring_events_db_url)
+        self.events = EventBus(repository=event_repo, cache_size=self.settings.monitoring_cache_size)
         self.audit = AuditSink()
         self.decision_graph = DecisionGraph(self.events, self.audit)
         self.kill_switch = KillSwitch()
