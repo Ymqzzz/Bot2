@@ -44,3 +44,50 @@ def test_killswitch_blocks_trading():
 
     assert decisions == []
     assert any(ev.event_type == "signal_rejected" for ev in bot.events.events)
+
+
+
+def test_pre_gate_risk_state_event_emitted():
+    bot = UpgradedBot()
+    market = DummyMarketData()
+    ctx = BrokerContext(
+        nav=100_000.0,
+        open_positions=[],
+        corr_matrix={},
+        realized_pnl=120.0,
+        unrealized_pnl=-20.0,
+        equity_now=100_500.0,
+    )
+
+    bot.run_cycle(market, ctx)
+
+    risk_events = [ev for ev in bot.events.events if ev.event_type == "risk_state_updated"]
+    assert risk_events
+    payload = risk_events[-1].payload
+    assert payload["realized_pnl"] == 120.0
+    assert payload["unrealized_pnl"] == -20.0
+    assert payload["equity_now"] == 100_500.0
+
+
+def test_pre_gate_risk_limits_emit_structured_block_event():
+    bot = UpgradedBot()
+    market = DummyMarketData()
+    bot.gov_state.equity_peak = 100_000.0
+    ctx = BrokerContext(
+        nav=95_000.0,
+        open_positions=[],
+        corr_matrix={},
+        realized_pnl=-2_500.0,
+        unrealized_pnl=0.0,
+        equity_now=80_000.0,
+    )
+
+    decisions = bot.run_cycle(market, ctx)
+
+    assert decisions == []
+    blocked = [ev for ev in bot.events.events if ev.event_type == "risk_blocked"]
+    assert blocked
+    payload = blocked[-1].payload
+    assert payload["reason"] in {"daily_loss_limit", "max_drawdown_limit"}
+    assert payload["current_drawdown_pct"] > 0
+    assert payload["loss_budget_usage_pct"] > 0
