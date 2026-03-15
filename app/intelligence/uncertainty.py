@@ -15,6 +15,15 @@ from app.intelligence.models import (
 
 
 class UncertaintyEngine:
+    @staticmethod
+    def _sample_quality(sample_quality_scores):
+        if isinstance(sample_quality_scores, dict):
+            return max(sample_quality_scores.values(), default=0.0)
+        try:
+            return float(sample_quality_scores)
+        except (TypeError, ValueError):
+            return 0.0
+
     def compute(
         self,
         *,
@@ -29,84 +38,44 @@ class UncertaintyEngine:
         strategy_health: StrategyHealthState,
         cross_asset: CrossAssetContextState,
         analog_confidence: float,
-    ) -> UncertaintyState:
-        drivers = {
-            "timeframe_conflict": mtf.conflict_score,
-            "sweep_ambiguity": 1.0 - sweep.sweep_confidence if sweep.sweep_detected else 0.55,
-            "structure_messiness": structure.messiness_penalty,
-            "event_contamination": event_risk.contamination_score,
-            "instrument_degradation": 1.0 - instrument_health.health_score,
-            "strategy_sample_uncertainty": 1.0 - max(strategy_health.sample_quality_scores.values(), default=0.0),
-            "analog_sparsity": 1.0 - analog_confidence,
-            "cross_asset_conflict": cross_asset.divergence_score,
-        }
-        weights = {
-            "timeframe_conflict": 0.16,
-            "sweep_ambiguity": 0.14,
-            "structure_messiness": 0.14,
-            "event_contamination": 0.16,
-            "instrument_degradation": 0.10,
-            "strategy_sample_uncertainty": 0.12,
-            "analog_sparsity": 0.10,
-            "cross_asset_conflict": 0.08,
-        }
-        score = clamp(sum(drivers[k] * w for k, w in weights.items()))
-        label = "extreme" if score > 0.8 else "high" if score > 0.62 else "moderate" if score > 0.4 else "low"
-        confidence_adjustment = clamp(-0.45 * score, -0.45, 0.0)
-        size_penalty = clamp(1.0 - 0.65 * score, 0.25, 1.0)
-        rank_penalty = clamp(0.55 * score)
-        rationale = [Evidence(code, weights[code], value, "uncertainty driver") for code, value in drivers.items()]
-        strategy_health: StrategyHealthState,
-        cross_asset: CrossAssetContextState,
-        analog_confidence: float,
-        spread_percentile: float,
+        spread_percentile: float = 50.0,
     ) -> UncertaintyState:
         drivers = {
             "mtf_conflict": mtf.conflict_score,
             "sweep_ambiguity": 1.0 - sweep.sweep_confidence,
             "structure_messiness": structure.messiness_penalty,
             "event_contamination": event_risk.contamination_score,
-            "strategy_sample_uncertainty": 1.0 - strategy_health.confidence,
+            "instrument_degradation": 1.0 - instrument_health.health_score,
+            "strategy_sample_uncertainty": 1.0 - self._sample_quality(strategy_health.sample_quality_scores),
             "analog_sparsity": 1.0 - analog_confidence,
             "cross_asset_conflict": cross_asset.divergence_score,
             "spread_stress": clamp(spread_percentile / 100.0),
         }
         weights = {
-            "mtf_conflict": 0.22,
+            "mtf_conflict": 0.2,
             "sweep_ambiguity": 0.14,
-            "structure_messiness": 0.15,
+            "structure_messiness": 0.14,
             "event_contamination": 0.14,
+            "instrument_degradation": 0.1,
             "strategy_sample_uncertainty": 0.1,
             "analog_sparsity": 0.1,
-            "cross_asset_conflict": 0.08,
-            "spread_stress": 0.07,
+            "cross_asset_conflict": 0.05,
+            "spread_stress": 0.03,
         }
         score = clamp(sum(drivers[k] * weights[k] for k in weights))
         label = "extreme" if score > 0.78 else "high" if score > 0.62 else "moderate" if score > 0.4 else "low"
-        confidence_adj = -0.35 * score
-        size_penalty = clamp(1.0 - 0.6 * score, 0.25, 1.0)
-        rank_penalty = clamp(0.7 * score)
         return UncertaintyState(
             timestamp=timestamp,
             instrument=instrument,
             trace_id=trace_id,
             confidence=clamp(1.0 - score),
-            sources=["mtf", "structure", "sweep", "event", "instrument", "strategy", "cross_asset", "analog"],
-            rationale=rationale,
-            uncertainty_score=score,
-            uncertainty_label=label,
-            uncertainty_drivers=drivers,
-            confidence_adjustment=confidence_adjustment,
-            size_penalty_multiplier=size_penalty,
-            ranking_penalty=rank_penalty,
-            block_if_extreme_flag=score > 0.9,
-            sources=["mtf", "structure", "sweep", "event", "strategy_health", "analog", "cross_asset"],
+            sources=["intelligence_engines"],
             rationale=[Evidence(code, weights[code], value, "uncertainty driver") for code, value in drivers.items()],
             uncertainty_score=score,
             uncertainty_label=label,
             uncertainty_drivers=drivers,
-            confidence_adjustment=confidence_adj,
-            size_penalty_multiplier=size_penalty,
-            ranking_penalty=rank_penalty,
+            confidence_adjustment=-0.35 * score,
+            size_penalty_multiplier=clamp(1.0 - 0.6 * score, 0.25, 1.0),
+            ranking_penalty=clamp(0.7 * score),
             block_if_extreme_flag=label == "extreme",
         )
