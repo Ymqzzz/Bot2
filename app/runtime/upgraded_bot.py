@@ -21,6 +21,12 @@ from app.risk.portfolio_adapter import PortfolioContext
 from app.risk.sizing import PositionSizer
 from app.risk.tail_risk import dislocation_score
 from app.strategy.registry import StrategyRegistry
+from app.ml.action_space import MetaAction
+from app.ml.config import DEFAULT_ML_CONFIG
+from app.ml.inference_service import InferenceService
+from app.ml.replay_store import ReplayStore
+from app.ml.rl_modes import RLMode
+from app.ml.state_builder import NormalizationStats, StateBuilder
 from app.strategy.plugins.breakout_plugin import BreakoutPlugin
 from app.strategy.plugins.mean_reversion_plugin import MeanReversionPlugin
 from app.strategy.plugins.trend_plugin import TrendPlugin
@@ -55,6 +61,9 @@ class UpgradedBot:
         self.sizer = PositionSizer()
         self.gov_state = GovernorState()
         self._last_trade_ts = 0.0
+        self.ml_config = DEFAULT_ML_CONFIG
+        self.state_builder = StateBuilder(NormalizationStats(version="v1", mean={}, std={}))
+        self.inference = InferenceService(self.ml_config, ReplayStore(self.ml_config.replay_store_path))
 
     def _refresh_governor_state(self, broker_ctx: BrokerContext) -> dict[str, float]:
         state = self.gov_state
@@ -80,6 +89,68 @@ class UpgradedBot:
             "loss_streak": state.loss_streak,
             "trades_today": state.trades_today,
         }
+
+
+
+    def _build_rl_state(self, instrument: str, feats: dict, spread_pctile: float, broker_ctx: BrokerContext, near_event: bool) -> dict:
+        market_state = {
+            "ret_1": float(feats.get("ret_1", 0.0)),
+            "ret_3": float(feats.get("ret_3", 0.0)),
+            "ret_12": float(feats.get("ret_12", 0.0)),
+            "realized_vol_20": float(feats.get("realized_vol", 0.0)),
+            "atr_norm": float(feats.get("atr", 0.0)),
+            "trend_slope_20": float(feats.get("trend_slope", 0.0)),
+            "mom_10": float(feats.get("momentum", 0.0)),
+            "vwap_distance": float(feats.get("vwap_distance", 0.0)),
+            "daily_range_pos": float(feats.get("daily_range_pos", 0.0)),
+            "prev_day_hilo_proximity": float(feats.get("prev_day_hilo_proximity", 0.0)),
+            "liquidity_sweep_flag": float(feats.get("liquidity_sweep", 0.0)),
+            "bos_flag": float(feats.get("bos", 0.0)),
+            "trend_regime_score": float(feats.get("trend_regime", 0.0)),
+            "chop_regime_score": float(feats.get("chop_regime", 0.0)),
+        }
+        signal_state = {
+            "confluence_score": float(feats.get("confluence", 0.0)),
+            "buy_score": float(feats.get("buy_score", 0.0)),
+            "sell_score": float(feats.get("sell_score", 0.0)),
+            "neutral_score": float(feats.get("neutral_score", 0.0)),
+            "confidence_score": float(feats.get("confidence", 0.0)),
+            "strategy_agreement_count": float(feats.get("strategy_agreement", 0.0)),
+            "strategy_disagreement_count": float(feats.get("strategy_disagreement", 0.0)),
+            "signal_streak": float(feats.get("signal_streak", 0.0)),
+            "instrument_recent_perf": float(feats.get("instrument_recent_perf", 0.0)),
+            "setup_recent_perf": float(feats.get("setup_recent_perf", 0.0)),
+        }
+        risk_state = {
+            "open_positions": float(len(broker_ctx.open_positions)),
+            "open_risk": float(abs(broker_ctx.unrealized_pnl)),
+            "unrealized_pnl": float(broker_ctx.unrealized_pnl),
+            "daily_drawdown": float(self.gov_state.intraday_drawdown_pct),
+            "weekly_drawdown": float(self.gov_state.intraday_drawdown_pct),
+            "trade_count_today": float(self.gov_state.trades_today),
+            "loss_streak": float(self.gov_state.loss_streak),
+            "risk_budget_remaining": float(max(0.0, self.settings.risk_budget_daily - self.gov_state.intraday_drawdown_pct)),
+            "correlation_exposure": 0.0,
+            "margin_utilization": 0.0,
+            "time_since_last_trade": float(max(0.0, time.time() - self._last_trade_ts)),
+        }
+        execution_state = {
+            "spread": spread_pctile / 100.0,
+            "normalized_spread": spread_pctile / max(self.settings.max_spread_pctile, 1.0),
+            "slippage_estimate": spread_pctile / 1000.0,
+            "latency_ms": 0.0,
+            "volatility_burst_flag": float(feats.get("volatility_burst", 0.0)),
+        }
+        context_state = {
+            "session_id": float(time.gmtime().tm_hour // 8),
+            "weekday": float(time.gmtime().tm_wday),
+            "hour_bucket": float(time.gmtime().tm_hour),
+            "macro_event_proximity": 1.0 if near_event else 0.0,
+            "news_blackout_flag": 1.0 if near_event else 0.0,
+            "weekend_liquidity_flag": 1.0 if time.gmtime().tm_wday >= 5 else 0.0,
+            "regime_cluster_id": 0.0,
+        }
+        return self.state_builder.build(market_state, signal_state, risk_state, execution_state, context_state)
 
     def _regime(self, bars: list[dict]) -> str:
         d = dislocation_score(bars, 50.0)
@@ -265,6 +336,24 @@ class UpgradedBot:
                 daily_risk_pct=self.settings.risk_budget_daily,
                 cluster_risk_pct=self.settings.cluster_risk_cap,
             )
+            rl_state = self._build_rl_state(instrument, feats, spread_pctile, broker_ctx, near_event)
+            rl_decision = self.inference.infer(
+                model=self.calibrator,
+                state=rl_state,
+                mode=RLMode(self.ml_config.mode),
+                has_candidate=True,
+                in_position=any(p.get("instrument") == instrument for p in broker_ctx.open_positions),
+                risk_deterioration=self.gov_state.intraday_drawdown_pct > self.settings.risk_budget_daily,
+                baseline_action=int(MetaAction.ALLOW_AS_IS),
+                ood_score=min(1.0, rl_state.missing_mask.mean()),
+            )
+            decision["rl_overlay"] = {
+                "action": rl_decision.action,
+                "confidence": rl_decision.gated.confidence,
+                "entropy": rl_decision.gated.entropy,
+                "gated_reason": rl_decision.gated.reason,
+                "latency_ms": rl_decision.latency_ms,
+            }
             decision["regime"] = regime
             decision["market_intelligence"] = intel_snapshot.to_dict()
             decision["dislocation"] = disloc
