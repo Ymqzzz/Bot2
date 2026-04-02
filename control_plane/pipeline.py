@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from .config import ControlPlaneConfig
+from .confluence_engine import AdaptiveConfluenceEngine
 from .correlation import CorrelationEngine
 from .event_engine import EventEngine
 from .execution_intel import ExecutionIntelligenceEngine
@@ -22,6 +23,7 @@ from .models import (
 from .order_tactics import OrderTacticPlanner
 from .portfolio_allocator import PortfolioAllocator
 from .regime_engine import RegimeEngine
+from .surveillance_engine import SurveillanceEngine
 from .storage import ControlPlaneStorage
 
 
@@ -37,6 +39,8 @@ class ControlPlanePipeline:
         self.regime_engine = RegimeEngine(self.config)
         self.event_engine = EventEngine(self.config, calendar_provider=calendar_provider)
         self.execution_engine = ExecutionIntelligenceEngine(self.config)
+        self.confluence_engine = AdaptiveConfluenceEngine(self.config)
+        self.surveillance_engine = SurveillanceEngine(self.config)
         self.allocator = PortfolioAllocator(self.config, self.correlation_engine)
         self.tactic_planner = OrderTacticPlanner(self.config)
         self.storage = storage or ControlPlaneStorage()
@@ -147,13 +151,34 @@ class ControlPlanePipeline:
                 continue
             filtered_candidates.append(c)
 
-        execution_decisions = self.build_execution_decisions(filtered_candidates, snapshots, regime_decisions, event_decision)
-        executable = [c for c in filtered_candidates if execution_decisions[c["candidate_id"]].allow_entry]
+        surveillance_decisions = {
+            c["candidate_id"]: self.surveillance_engine.evaluate_candidate(c, snapshots.get(c["instrument"], {}))
+            for c in filtered_candidates
+        }
+        risk_eligible = [
+            c for c in filtered_candidates if surveillance_decisions[c["candidate_id"]].allow_trade
+        ]
+
+        execution_decisions = self.build_execution_decisions(risk_eligible, snapshots, regime_decisions, event_decision)
+        executable = [c for c in risk_eligible if execution_decisions[c["candidate_id"]].allow_entry]
 
         portfolio_state = self.allocator.build_portfolio_state(open_positions, [], {})
         for c in executable:
             rd = regime_decisions[c["instrument"]]
             ed = execution_decisions[c["candidate_id"]]
+            sd = surveillance_decisions[c["candidate_id"]]
+            corr_penalty = self.correlation_engine.compute_portfolio_overlap(c, open_positions, portfolio_state.correlation_matrix)
+            cd = self.confluence_engine.evaluate_candidate(
+                c,
+                regime_score=rd.regime_confidence,
+                event_score=event_decision.event_risk_multiplier,
+                execution_score=ed.fill_probability_score,
+                correlation_penalty=corr_penalty,
+            )
+            requested_risk = float(c.get("risk_fraction_requested", 0.0))
+            c["risk_fraction_requested"] = requested_risk * cd.risk_multiplier * sd.risk_multiplier
+            if cd.confluence_score < self.config.CONFLUENCE_MIN_SCORE_TO_ALLOCATE:
+                continue
             ac = AllocationCandidate(
                 candidate_id=c["candidate_id"],
                 instrument=c["instrument"],
@@ -174,7 +199,7 @@ class ControlPlanePipeline:
                 correlation_bucket=None,
                 priority_score=0.0,
                 blocked=False,
-                block_reason_codes=[],
+                block_reason_codes=list(dict.fromkeys(cd.reason_codes + sd.reason_codes)),
             )
             ac.priority_score = self.allocator.score_candidate_priority(ac, rd, event_decision, ed, edge_context)
             alloc_candidates.append(ac)
@@ -183,6 +208,12 @@ class ControlPlanePipeline:
         approved = [c for c in executable if c["candidate_id"] in allocation.approved_candidate_ids]
         _ = self.build_tactic_plans(approved, execution_decisions, regime_decisions, event_decision)
 
+        cycle_reasons: list[str] = []
+        for d in surveillance_decisions.values():
+            cycle_reasons.extend(d.reason_codes)
+        for c in alloc_candidates:
+            cycle_reasons.extend(c.block_reason_codes)
+
         return ControlPlaneSnapshot(
             asof=asof,
             regime_decisions=regime_decisions,
@@ -190,5 +221,5 @@ class ControlPlanePipeline:
             execution_decisions=execution_decisions,
             allocation_decision=allocation,
             portfolio_state=portfolio_state,
-            reason_codes=[],
+            reason_codes=list(dict.fromkeys(cycle_reasons)),
         )
