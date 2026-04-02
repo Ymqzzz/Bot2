@@ -66,6 +66,24 @@ class ControlPlaneConfig:
     EVENT_ALLOW_BREAKOUT_POST_RELEASE_ONLY: bool = field(default_factory=lambda: _b("EVENT_ALLOW_BREAKOUT_POST_RELEASE_ONLY", True))
     EVENT_BLOCK_MEAN_REVERSION_NEAR_HIGH_IMPACT: bool = field(default_factory=lambda: _b("EVENT_BLOCK_MEAN_REVERSION_NEAR_HIGH_IMPACT", True))
     EVENT_BLOCK_NEW_POSITIONS_IF_CALENDAR_UNAVAILABLE: bool = field(default_factory=lambda: _b("EVENT_BLOCK_NEW_POSITIONS_IF_CALENDAR_UNAVAILABLE", False))
+    CONFLUENCE_ENGINE_ENABLED: bool = field(default_factory=lambda: _b("CONFLUENCE_ENGINE_ENABLED", True))
+    CONFLUENCE_MIN_SCORE_TO_ALLOCATE: float = field(default_factory=lambda: _f("CONFLUENCE_MIN_SCORE_TO_ALLOCATE", 0.25))
+    CONFLUENCE_WEIGHT_EV: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_EV", 0.25))
+    CONFLUENCE_WEIGHT_CONFIDENCE: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_CONFIDENCE", 0.20))
+    CONFLUENCE_WEIGHT_EDGE: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_EDGE", 0.15))
+    CONFLUENCE_WEIGHT_REGIME: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_REGIME", 0.15))
+    CONFLUENCE_WEIGHT_EVENT: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_EVENT", 0.10))
+    CONFLUENCE_WEIGHT_EXECUTION: float = field(default_factory=lambda: _f("CONFLUENCE_WEIGHT_EXECUTION", 0.15))
+    CONFLUENCE_CORRELATION_PENALTY_WEIGHT: float = field(default_factory=lambda: _f("CONFLUENCE_CORRELATION_PENALTY_WEIGHT", 0.40))
+    CONFLUENCE_RISK_MULTIPLIER_BOUNDS: tuple[float, float] = field(
+        default_factory=lambda: (
+            _f("CONFLUENCE_RISK_MULTIPLIER_MIN", 0.5),
+            _f("CONFLUENCE_RISK_MULTIPLIER_MAX", 1.2),
+        )
+    )
+    SURVEILLANCE_ENGINE_ENABLED: bool = field(default_factory=lambda: _b("SURVEILLANCE_ENGINE_ENABLED", True))
+    SURVEILLANCE_MAX_TOXICITY: float = field(default_factory=lambda: _f("SURVEILLANCE_MAX_TOXICITY", 0.85))
+    SURVEILLANCE_SOFT_TOXICITY: float = field(default_factory=lambda: _f("SURVEILLANCE_SOFT_TOXICITY", 0.65))
     EXECUTION_INTEL_ENABLED: bool = field(default_factory=lambda: _b("EXECUTION_INTEL_ENABLED", True))
     EXECUTION_FILL_PROB_THRESHOLD: float = field(default_factory=lambda: _f("EXECUTION_FILL_PROB_THRESHOLD", 0.35))
     EXECUTION_MAX_EXPECTED_SLIPPAGE_BPS: float = field(default_factory=lambda: _f("EXECUTION_MAX_EXPECTED_SLIPPAGE_BPS", 3.0))
@@ -89,6 +107,15 @@ class ControlPlaneConfig:
             raise ValueError("ALLOC_MAX_NEW_TRADES_PER_CYCLE must be >=1")
         if self.TACTIC_MAX_CLIPS < 1:
             raise ValueError("TACTIC_MAX_CLIPS must be >=1")
+        lo, hi = self.CONFLUENCE_RISK_MULTIPLIER_BOUNDS
+        if not (0.0 <= self.CONFLUENCE_MIN_SCORE_TO_ALLOCATE <= 1.0):
+            raise ValueError("CONFLUENCE_MIN_SCORE_TO_ALLOCATE must be [0,1]")
+        if lo <= 0 or hi <= 0 or lo > hi:
+            raise ValueError("CONFLUENCE risk multiplier bounds must be positive and ordered")
+        if not (0.0 <= self.SURVEILLANCE_SOFT_TOXICITY <= 1.0 and 0.0 <= self.SURVEILLANCE_MAX_TOXICITY <= 1.0):
+            raise ValueError("Surveillance thresholds must be [0,1]")
+        if self.SURVEILLANCE_SOFT_TOXICITY > self.SURVEILLANCE_MAX_TOXICITY:
+            raise ValueError("SURVEILLANCE_SOFT_TOXICITY must be <= SURVEILLANCE_MAX_TOXICITY")
 
 
 def load_config() -> ControlPlaneConfig:
