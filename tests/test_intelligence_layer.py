@@ -93,6 +93,8 @@ def test_orchestrator_builds_snapshot_with_all_states() -> None:
     assert 0.0 <= snap.uncertainty.uncertainty_score <= 1.0
     assert 0.0 <= snap.trade_quality.quality_score <= 1.0
     assert 0.0 <= snap.calibration.calibrated_confidence <= 1.0
+    assert snap.adaptive is not None
+    assert "dominant_thesis" in snap.adaptive.thesis_vector
 
 
 def test_orchestrator_degrades_with_missing_cross_asset_and_history() -> None:
@@ -114,3 +116,4 @@ def test_orchestrator_degrades_with_missing_cross_asset_and_history() -> None:
     assert snap.analog.insufficient_history_flag
     assert snap.uncertainty.uncertainty_score > 0.0
     assert snap.calibration.calibration_bucket in {"penalized", "neutral", "boosted"}
+    assert snap.adaptive is not None
