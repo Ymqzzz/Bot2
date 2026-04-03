@@ -4,6 +4,9 @@ from datetime import datetime
 import uuid
 
 from app.intelligence.analog import AnalogEngine
+from app.intelligence.adaptive import (
+    AdaptiveOperatingLayer,
+)
 from app.intelligence.base import EngineInput
 from app.intelligence.calibrator import ConfidenceCalibrator
 from app.intelligence.cross_asset import CrossAssetEngine
@@ -35,6 +38,7 @@ class IntelligenceOrchestrator:
         self.trade_quality = TradeQualityEngine()
         self.analog = AnalogEngine()
         self.calibrator = ConfidenceCalibrator()
+        self.adaptive_layer = AdaptiveOperatingLayer()
 
     def build_snapshot(
         self,
@@ -95,6 +99,18 @@ class IntelligenceOrchestrator:
             uncertainty=pre_uncertainty,
             portfolio_conflict=float(context.get("portfolio_conflict", 0.0)),
         )
+        expected_edge = float(context.get("expected_edge", quality.quality_score - 0.5))
+        adaptive_state = self.adaptive_layer.evaluate(
+            timestamp=ts,
+            instrument=instrument,
+            trace_id=trace_id,
+            features=features,
+            context=context,
+            candidate_strategy=candidate_strategy,
+            base_confidence=quality.approval_confidence,
+            base_size_multiplier=quality.size_multiplier,
+            expected_edge=expected_edge,
+        )
 
         base = MarketIntelligenceSnapshot(
             timestamp=ts,
@@ -113,6 +129,7 @@ class IntelligenceOrchestrator:
             cross_asset=cross,
             trade_quality=quality,
             uncertainty=pre_uncertainty,
+            adaptive=adaptive_state,
             integrity_flags={},
         )
 
