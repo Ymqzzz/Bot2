@@ -274,6 +274,24 @@ class ConfidenceCalibrationState(IntelligenceState):
 
 
 @dataclass(frozen=True)
+class AdaptiveIntelligenceState(IntelligenceState):
+    capital_efficiency: dict[str, Any] = field(default_factory=dict)
+    thesis_vector: dict[str, Any] = field(default_factory=dict)
+    negotiation: dict[str, Any] = field(default_factory=dict)
+    path_dependency: dict[str, Any] = field(default_factory=dict)
+    retry: dict[str, Any] = field(default_factory=dict)
+    edge_persistence: dict[str, Any] = field(default_factory=dict)
+    adversary: dict[str, Any] = field(default_factory=dict)
+    execution_memory: dict[str, Any] = field(default_factory=dict)
+    decision_narrative: dict[str, Any] = field(default_factory=dict)
+    sandbox: dict[str, Any] = field(default_factory=dict)
+    adaptive_approval: bool = False
+    adaptive_confidence_delta: float = 0.0
+    adaptive_size_delta: float = 0.0
+    reason_codes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class MarketIntelligenceSnapshot(IntelligenceState):
     regime: RegimeState | None = None
     mtf_bias: MultiTimeframeBiasState | None = None
@@ -288,6 +306,7 @@ class MarketIntelligenceSnapshot(IntelligenceState):
     uncertainty: UncertaintyState | None = None
     analog: AnalogSimilarityState | None = None
     calibration: ConfidenceCalibrationState | None = None
+    adaptive: AdaptiveIntelligenceState | None = None
     integrity_flags: dict[str, bool] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
