@@ -23,3 +23,6 @@ class TradeIntelEventEmitter:
     def edge_state_degraded(self, payload: dict[str, Any]) -> None: self.emit("edge_state_degraded", payload)
     def strategy_disabled(self, payload: dict[str, Any]) -> None: self.emit("strategy_disabled", payload)
     def strategy_reenabled(self, payload: dict[str, Any]) -> None: self.emit("strategy_reenabled", payload)
+    def decision_declined(self, payload: dict[str, Any]) -> None: self.emit("decision_declined", payload)
+    def decision_degraded_approved(self, payload: dict[str, Any]) -> None: self.emit("decision_degraded_approved", payload)
+    def health_degraded(self, payload: dict[str, Any]) -> None: self.emit("health_degraded", payload)
