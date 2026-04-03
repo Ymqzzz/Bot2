@@ -4,13 +4,19 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .attribution import TradeAttributionEngine
+from .decision_engine import DecisionEngine, build_decision_engine
+from .execution_simulator import ExecutionSimulator
 from .config import TradeIntelConfig
 from .edge_decay import EdgeDecayEngine
 from .events import TradeIntelEventEmitter
 from .exits import SmartExitEngine
+from .health_monitor import HealthMonitor
 from .lifecycle import TradeLifecycleManager
+from .trade_attribution_engine import LiveAttributionEngine
 from .models import TradeLifecycleRecord
 from .performance_store import PerformanceStore
+from .regime_transition_model import RegimeTransitionModel
+from .signal_graph import SignalDependencyGraph
 from .sizing import AdaptiveSizingEngine
 from .storage import TradeIntelStorage
 
@@ -24,6 +30,12 @@ class TradeIntelPipeline:
         attribution_engine: TradeAttributionEngine,
         performance_store: PerformanceStore,
         edge_engine: EdgeDecayEngine,
+        decision_engine: DecisionEngine,
+        execution_simulator: ExecutionSimulator,
+        regime_model: RegimeTransitionModel,
+        signal_graph: SignalDependencyGraph,
+        health_monitor: HealthMonitor,
+        live_attribution: LiveAttributionEngine,
         lifecycle_manager: TradeLifecycleManager,
         storage: TradeIntelStorage,
         events: TradeIntelEventEmitter,
@@ -34,6 +46,12 @@ class TradeIntelPipeline:
         self.attribution_engine = attribution_engine
         self.performance_store = performance_store
         self.edge_engine = edge_engine
+        self.decision_engine = decision_engine
+        self.execution_simulator = execution_simulator
+        self.regime_model = regime_model
+        self.signal_graph = signal_graph
+        self.health_monitor = health_monitor
+        self.live_attribution = live_attribution
         self.lifecycle_manager = lifecycle_manager
         self.storage = storage
         self.events = events
@@ -43,6 +61,24 @@ class TradeIntelPipeline:
         block_edge, block_reasons = self.edge_engine.should_block_trade(edge_snaps)
         if block_edge:
             self.events.trade_blocked_by_edge_health({"candidate": candidate, "reason_codes": block_reasons})
+        health_state = self.health_monitor.assess(market_intel_snapshot, runtime_context)
+        if health_state.degraded:
+            self.events.health_degraded({"status": health_state.status, "reason_codes": health_state.reason_codes})
+        regime_state = self.regime_model.update(runtime_context)
+        signal_report = self.signal_graph.analyze(candidate, runtime_context)
+        execution_est = self.execution_simulator.estimate(candidate, market_intel_snapshot)
+        distribution = self.decision_engine.build_distribution(candidate, execution_est, signal_report, regime_state, market_intel_snapshot)
+        decision = self.decision_engine.decide(
+            candidate,
+            distribution,
+            execution_est,
+            signal_report,
+            regime_state,
+            health_state.block_trading,
+            health_state.risk_multiplier_cap,
+            health_state.reason_codes,
+            str(runtime_context.get("session_name", "UNKNOWN")),
+        )
         sizing = self.sizing_engine.recommend_size(
             candidate,
             market_intel_snapshot,
@@ -50,7 +86,15 @@ class TradeIntelPipeline:
             edge_snaps,
             runtime_context.get("recent_performance", {}),
         )
-        blocked = block_edge or sizing.block_trade
+        if decision.size_multiplier_cap < 1.0 and not sizing.block_trade:
+            sizing.recommended_risk_fraction *= decision.size_multiplier_cap
+            sizing.size_multiplier_total *= decision.size_multiplier_cap
+            sizing.reason_codes.extend(decision.reason_codes)
+        blocked = block_edge or sizing.block_trade or (not decision.approved)
+        if not decision.approved:
+            self.events.decision_declined({"candidate": candidate, "reason_codes": decision.decline_reason_hierarchy})
+        elif decision.approval_status == "degraded_approved":
+            self.events.decision_degraded_approved({"candidate": candidate, "reason_codes": decision.reason_codes})
         fp = self.attribution_engine.build_trade_fingerprint(candidate, runtime_context, sizing.reason_codes, block_reasons)
         plan = self.exit_engine.build_initial_exit_plan({
             "trade_id": fp.trade_id,
@@ -77,7 +121,20 @@ class TradeIntelPipeline:
         self.storage.append_jsonl("trade_fingerprints", fp.to_flat_dict())
         self.storage.append_jsonl("trade_sizing_decisions", sizing.to_flat_dict())
         self.storage.append_jsonl("trade_exit_plans", plan.to_flat_dict())
-        return {"trade_id": fp.trade_id, "fingerprint": fp, "sizing_decision": sizing, "exit_plan": plan, "block_trade": blocked, "reason_codes": sizing.reason_codes + block_reasons}
+        self.storage.append_jsonl("trade_decision_distributions", distribution.to_dict())
+        self.storage.append_jsonl("trade_decisions", decision.to_dict())
+        return {
+            "trade_id": fp.trade_id,
+            "fingerprint": fp,
+            "sizing_decision": sizing,
+            "exit_plan": plan,
+            "block_trade": blocked,
+            "reason_codes": sizing.reason_codes + block_reasons + decision.reason_codes,
+            "decision": decision,
+            "distribution": distribution,
+            "execution_estimate": execution_est,
+            "regime_transition_state": regime_state,
+        }
 
     def on_trade_open(self, trade_info: dict[str, Any], market_context: dict[str, Any]) -> dict[str, Any]:
         trade_id = str(trade_info["trade_id"])
@@ -118,9 +175,21 @@ class TradeIntelPipeline:
         exit_q = self.attribution_engine.assess_exit_quality(path, {**close_info, "realized_r": realized_r})
         attr = self.attribution_engine.attribute_outcome(trade_id, rec.fingerprint, entry_q, exit_q, path, realized_r, market_context)
         final = self.attribution_engine.finalize_lifecycle_record(rec, entry_q, path, exit_q, attr, float(close_info.get("realized_pnl", 0.0)), realized_r)
+        online_attr = self.live_attribution.process_closed_trade(
+            {
+                "ev_r": rec.fingerprint.expected_value_raw,
+                "instrument": rec.fingerprint.instrument,
+                "regime": rec.fingerprint.regime_name,
+                "session": rec.fingerprint.session_name,
+                "supporting_engines": market_context.get("supporting_engines", []),
+                "opposing_engines": market_context.get("opposing_engines", []),
+            },
+            close_info,
+        )
         self.lifecycle_manager.close_trade(trade_id)
         self.performance_store.update_with_closed_trade(final)
         self.storage.append_jsonl("trade_lifecycle_records", final.to_flat_dict())
+        self.storage.append_jsonl("trade_online_attribution", {"trade_id": trade_id, "engine_trust": online_attr.engine_trust, "labels": online_attr.labels})
         self.events.trade_finalized({"trade_id": trade_id, "outcome": attr.outcome_label})
         return {"trade_id": trade_id, "status": "closed", "outcome": attr.outcome_label}
 
@@ -144,6 +213,12 @@ def build_default_pipeline(config: TradeIntelConfig) -> TradeIntelPipeline:
         attribution_engine=TradeAttributionEngine(config),
         performance_store=PerformanceStore(config, edge),
         edge_engine=edge,
+        decision_engine=build_decision_engine(),
+        execution_simulator=ExecutionSimulator(),
+        regime_model=RegimeTransitionModel(),
+        signal_graph=SignalDependencyGraph(),
+        health_monitor=HealthMonitor(),
+        live_attribution=LiveAttributionEngine(),
         lifecycle_manager=TradeLifecycleManager(),
         storage=TradeIntelStorage(config),
         events=TradeIntelEventEmitter(),

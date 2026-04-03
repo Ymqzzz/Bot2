@@ -93,6 +93,11 @@ class TradeIntelConfig:
     PERF_TRACK_BY_SETUP_TYPE: bool = _get_bool("PERF_TRACK_BY_SETUP_TYPE", True)
     PERF_TRACK_BY_SPREAD_REGIME: bool = _get_bool("PERF_TRACK_BY_SPREAD_REGIME", True)
 
+    DECISION_ENGINE_ENABLED: bool = _get_bool("DECISION_ENGINE_ENABLED", True)
+    DECISION_MIN_EXECUTION_QUALITY: float = _get_float("DECISION_MIN_EXECUTION_QUALITY", 0.25, 0.0, 1.0)
+    DECISION_MAX_DOWNSIDE_R: float = _get_float("DECISION_MAX_DOWNSIDE_R", 0.85, 0.0)
+    DECISION_MAX_TRANSITION_RISK: float = _get_float("DECISION_MAX_TRANSITION_RISK", 0.70, 0.0, 1.0)
+
 
 def load_config() -> TradeIntelConfig:
     return TradeIntelConfig()
