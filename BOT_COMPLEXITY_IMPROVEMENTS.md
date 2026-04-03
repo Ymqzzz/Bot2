@@ -449,10 +449,18 @@ Your additional list is strong. The right move is to map each family to a **spec
 - Tick-rule signing for aggressor-side inference.
 - Pre-trade/post-trade TCA with order-flow-conditioned slippage.
 - Fourier/spectral intraday periodicity features (session-specific liquidity cycles).
+- Order-book resiliency proxy (post-sweep refill speed) from top-of-book snapshots.
+- VPIN-style flow-to-volatility stress indicator for throttling participation.
+- Queue-position decay proxy for limit-order urgency switching.
 
 **Adopt later (venue-dependent):**
 - Auction market variants, hybrid venue routing, deep queueing-theory models.
 - These depend on venue-level LOB granularity that many retail FX feeds do not expose reliably.
+
+**Intra-family interactions to wire now:**
+- Couple imbalance-bar burst detection with VPIN spikes to raise execution caution tier.
+- Use spectral session liquidity score to modulate queue-decay urgency thresholds.
+- Feed resiliency proxy into adverse-selection model to choose passive vs aggressive child orders.
 
 ### B) Advanced stochastic process concepts
 
@@ -460,30 +468,54 @@ Your additional list is strong. The right move is to map each family to a **spec
 - Jump-aware volatility features (Merton-style jump proxies, semivariance splits).
 - Regime-switching jump processes for stress periods.
 - Heston/CEV-inspired volatility state variables as latent features (not full pricing engines).
+- Realized quarticity and bipower variation for robust jump/no-jump decomposition.
+- Rough-volatility proxy (short-horizon variance-of-variance slope) as turbulence feature.
+- Asymmetric downside semivariance term-structure features for stop-distance conditioning.
 
 **Research mode first:**
 - McKean-Vlasov SDEs, particle methods, and full semimartingale calibration stacks.
 - Use only if you have robust calibration data and compute budget.
+
+**Intra-family interactions to wire now:**
+- Gate jump-process state transitions by bipower-vs-quarticity divergence.
+- Blend rough-vol proxy with semivariance asymmetry to tune tail-risk multiplier.
+- Pass latent vol-state confidence into regime-switching transition penalties.
 
 ### C) Advanced ML/AI concepts
 
 **Adopt now (practical):**
 - Synthetic scenario generation for robustness testing.
 - Conservative deep models for forecasting only (with strict calibration + interpretability checks).
+- Monotonic gradient-boosting baselines with explicit shape constraints for governance-friendly alpha.
+- Conformal prediction intervals for online uncertainty-aware sizing caps.
+- Snapshot ensembling + temporal bagging for regime-fragility reduction.
 
 **Research mode first:**
 - Fractal/quantum neural variants, deep hedging agents, and fully model-free hedging.
 - Keep in sandbox unless they beat simpler baselines after costs and latency penalties.
+
+**Intra-family interactions to wire now:**
+- Use conformal interval width as a direct penalty in ensemble model-weight updates.
+- Trigger synthetic scenario replay on detected calibration drift from temporal bags.
+- Allow monotonic-GBM forecasts to act as stability anchors when deep model confidence degrades.
 
 ### D) Monte Carlo & computational acceleration
 
 **Adopt now (practical):**
 - Quasi-Monte Carlo / bootstrap for confidence intervals and stress testing.
 - Adaptive sampling in replay/walk-forward optimization.
+- Stratified block bootstrap preserving session and event-time structure.
+- Importance sampling around tail-loss regions for faster CVaR estimate convergence.
+- Multi-fidelity simulation (cheap proxy model + selective high-fidelity reruns).
 
 **Adopt later:**
 - Non-reversible Langevin / SGHMC accelerators and specialized perturbation methods.
 - Useful for heavy Bayesian inference pipelines, otherwise unnecessary complexity.
+
+**Intra-family interactions to wire now:**
+- Drive adaptive sampling budget from block-bootstrap instability scores.
+- Reweight tail scenarios with importance sampling based on latest drawdown state.
+- Use multi-fidelity disagreement as a promotion-gate confidence penalty.
 
 ### E) Derivatives/volatility advanced methods
 
@@ -492,15 +524,26 @@ For a spot FX bot, prioritize risk-transfer insights rather than full exotic pri
 **Adopt now (practical):**
 - Local/stochastic vol diagnostics from observable option-implied proxies when available.
 - Delta/Gamma exposure awareness only if trading options or option-sensitive overlays.
+- 25-delta risk-reversal and butterfly skew features as directional/crowding context.
+- Implied-vs-realized vol spread z-score for timing aggressiveness throttles.
+- Term-structure twist metric (front-back IV slope change) for event-window risk posture.
 
 **Research mode first:**
 - Full BSDE/PDE solvers, adversarial PDE nets, and high-dimensional option calibration engines.
+
+**Intra-family interactions to wire now:**
+- Raise event-contamination penalty when IV twist and realized-vol jump trigger together.
+- Let skew dislocations adjust carry/trend overlay conviction caps.
+- Use implied-realized spread extremes to tighten stop placement and reduce clip size.
 
 ### F) Portfolio/risk framework concepts
 
 **Adopt now (practical):**
 - Rolling window validation, max drawdown governance, stress limits, capital allocation policy.
 - Buy-side style pre/post-trade risk analytics and TCA integration.
+- Incremental CVaR contribution budgeting per strategy and per instrument cluster.
+- Correlation-regime-aware leverage scaler using rolling shrinkage covariance.
+- Drawdown convexity monitor (loss acceleration) for early governor escalation.
 
 ### G) Strategy family concepts
 
@@ -509,9 +552,19 @@ Some listed items are not direct FX spot alpha engines (e.g., equity valuation, 
 **Adopt now (practical for FX):**
 - Global macro + managed futures style trend/carry overlays.
 - Event-driven macro shock models.
+- Volatility-breakout family with session-conditional trigger logic.
+- Cross-asset dispersion/reversion family using rates-equities-commodities disagreement.
+- Mean-reversion microstructure fade family around failed liquidity sweeps.
+- Relative-value carry-rotation family with risk-adjusted spread persistence filters.
 
 **Lower priority for spot-FX-only scope:**
 - Dedicated short-bias equity constructs and pure equity valuation frameworks.
+
+**Intra-family interactions to wire now:**
+- Strategy-level conflict matrix: suppress trades when trend/carry and microstructure-fade disagree.
+- Allocate risk by orthogonality score so highly correlated families share capped capital.
+- Require at least one macro/event family and one execution-timing family to agree for full-size entries.
+- Feed family-level decay signals into dynamic probation windows and recovery sizing.
 
 ---
 
@@ -932,4 +985,3 @@ This is how you can realistically absorb a very broad quant toolkit while protec
   - approximate probability of positive expectancy.
 - Decay should trigger on either sustained mechanical weakness *or* posterior confidence collapse.
 - Keep probation/recovery states for strategies that improve after disablement.
-
