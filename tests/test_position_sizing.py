@@ -65,3 +65,17 @@ def test_intelligence_multipliers_affect_units():
 
     assert abs(penalized.signed_units) < abs(baseline.signed_units)
     assert abs(boosted.signed_units) > abs(baseline.signed_units)
+
+
+def test_strategy_health_and_open_risk_reduce_units():
+    sizer = PositionSizer()
+    baseline = _compute(sizer, strategy_health_multiplier=1.0)
+    unhealthy_strategy = _compute(sizer, strategy_health_multiplier=0.3)
+    with_open_risk = _compute(
+        sizer,
+        open_positions=[{"units": 10_000, "entry_price": 1.1000, "stop_loss": 1.0950}],
+    )
+
+    assert abs(unhealthy_strategy.signed_units) < abs(baseline.signed_units)
+    assert abs(with_open_risk.signed_units) < abs(baseline.signed_units)
+    assert with_open_risk.open_risk_pct > 0.0

@@ -11,10 +11,13 @@ class SizingDiagnostics:
     stop_volatility_multiplier: float
     dislocation_multiplier: float
     portfolio_budget_pct: float
+    open_risk_pct: float
+    open_risk_multiplier: float
     max_units_cap: int
     capped: bool
     quality_multiplier: float = 1.0
     uncertainty_multiplier: float = 1.0
+    strategy_health_multiplier: float = 1.0
     strategy_multiplier: float = 1.0
 
     def to_dict(self) -> dict:
@@ -62,10 +65,11 @@ class PositionSizer:
         uncertainty_multiplier: float = 1.0,
         strategy_health_multiplier: float = 1.0,
         strategy_multiplier: float = 1.0,
+        tail_risk_multiplier: float = 1.0,
     ) -> SizingDiagnostics:
         nav_f = max(float(nav), 0.0)
         if nav_f <= 0:
-            return SizingDiagnostics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False)
+            return SizingDiagnostics(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, False)
 
         stop_distance = max(abs(float(entry_price) - float(stop_loss)), 1e-9)
         atr_f = max(float(atr), 1e-9)
@@ -74,6 +78,8 @@ class PositionSizer:
         open_risk_pct = self._estimate_open_risk_pct(open_positions, nav_f)
         remaining_daily_risk = max(0.0, float(daily_risk_pct) - open_risk_pct)
         portfolio_budget_pct = min(float(cluster_risk_pct), remaining_daily_risk * 0.50)
+        open_risk_utilization = self._clamp(open_risk_pct / max(float(daily_risk_pct), 1e-9), 0.0, 2.0)
+        open_risk_multiplier = self._clamp(1.0 - 0.70 * open_risk_utilization, 0.15, 1.0)
 
         confidence_multiplier = self._clamp(0.35 + 0.65 * float(confidence), 0.20, 1.00)
         spread_multiplier = self._clamp(1.0 - 0.60 * (float(spread_pctile) / 100.0), 0.20, 1.00)
@@ -84,12 +90,24 @@ class PositionSizer:
 
         risk_budget_notional = nav_f * portfolio_budget_pct
         denom = max(atr_f * 10_000.0 * dislocation_multiplier, 1e-9)
-        intelligence_multiplier = self._clamp(float(quality_multiplier) * float(uncertainty_multiplier) * float(strategy_health_multiplier), 0.2, 1.6)
-        raw_units = risk_budget_notional * confidence_multiplier * spread_multiplier * stop_volatility_multiplier * intelligence_multiplier / denom
         q_mult = self._clamp(float(quality_multiplier), 0.2, 1.8)
         u_mult = self._clamp(float(uncertainty_multiplier), 0.2, 1.0)
+        sh_mult = self._clamp(float(strategy_health_multiplier), 0.2, 1.3)
         s_mult = self._clamp(float(strategy_multiplier), 0.25, 1.5)
-        raw_units = risk_budget_notional * confidence_multiplier * spread_multiplier * stop_volatility_multiplier * q_mult * u_mult * s_mult / denom
+        t_mult = self._clamp(float(tail_risk_multiplier), 0.1, 1.2)
+        raw_units = (
+            risk_budget_notional
+            * confidence_multiplier
+            * spread_multiplier
+            * stop_volatility_multiplier
+            * open_risk_multiplier
+            * q_mult
+            * u_mult
+            * sh_mult
+            * s_mult
+            * t_mult
+            / denom
+        )
 
         max_units_cap = int(max(0.0, nav_f * self.max_notional_nav_multiple / max(float(entry_price), 1e-6)))
         units_abs = int(max(0.0, raw_units))
@@ -104,9 +122,12 @@ class PositionSizer:
             stop_volatility_multiplier=stop_volatility_multiplier,
             dislocation_multiplier=dislocation_multiplier,
             portfolio_budget_pct=portfolio_budget_pct,
+            open_risk_pct=open_risk_pct,
+            open_risk_multiplier=open_risk_multiplier,
             max_units_cap=max_units_cap,
             capped=capped,
             quality_multiplier=q_mult,
             uncertainty_multiplier=u_mult,
+            strategy_health_multiplier=sh_mult,
             strategy_multiplier=s_mult,
         )
