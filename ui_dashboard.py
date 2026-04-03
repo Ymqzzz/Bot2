@@ -107,6 +107,9 @@ def _collect_processes() -> list[dict[str, Any]]:
 def dashboard() -> str:
     logs = _collect_logs()
     processes = _collect_processes()
+    total_cpu = sum(process["cpu_percent"] for process in processes)
+    total_memory_mb = sum(process["memory_mb"] for process in processes)
+    heavy_process = processes[0] if processes else None
 
     process_rows = "".join(
         f"<tr><td>{p['pid']}</td><td>{html.escape(p['name'])}</td><td>{html.escape(p['status'])}</td><td>{p['cpu_percent']:.1f}</td><td>{p['memory_mb']:.2f}</td><td><code>{html.escape(p['cmdline'])}</code></td></tr>"
@@ -132,34 +135,73 @@ def dashboard() -> str:
     <meta http-equiv=\"refresh\" content=\"{AUTO_REFRESH_SECONDS}\" />
     <title>Runtime Ops Dashboard</title>
     <style>
-        body {{ font-family: Inter, Arial, sans-serif; margin: 0; padding: 1rem 1.2rem; background: #0f172a; color: #e2e8f0; }}
+        :root {{
+            color-scheme: dark;
+            --bg: #0b1220;
+            --bg-accent: radial-gradient(circle at top right, rgba(59, 130, 246, 0.2), transparent 36%);
+            --card: #111827;
+            --card-border: #1f2937;
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --primary: #93c5fd;
+            --secondary: #bfdbfe;
+        }}
+        body {{ font-family: Inter, Arial, sans-serif; margin: 0; padding: 1rem 1.2rem 2rem; background: var(--bg); background-image: var(--bg-accent); color: var(--text); }}
+        .header {{ display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: .8rem; margin-bottom: 1rem; }}
+        .header-right {{ text-align: right; }}
+        .pill {{ display: inline-block; background: #1e293b; border: 1px solid #334155; border-radius: 999px; padding: .22rem .6rem; font-size: .8rem; color: var(--secondary); }}
+        .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: .8rem; margin-bottom: 1rem; }}
+        .stat {{ background: linear-gradient(180deg, #111827 0%, #0f172a 100%); border: 1px solid var(--card-border); border-radius: 10px; padding: .75rem .85rem; }}
+        .stat .label {{ color: var(--muted); font-size: .8rem; margin-bottom: .2rem; }}
+        .stat .value {{ font-size: 1.1rem; font-weight: 600; letter-spacing: .01em; color: #f8fafc; }}
         .grid {{ display: grid; grid-template-columns: repeat(12, 1fr); gap: 1rem; }}
-        .card {{ background: #111827; border: 1px solid #1f2937; border-radius: 10px; padding: 1rem; }}
+        .card {{ background: var(--card); border: 1px solid var(--card-border); border-radius: 12px; padding: 1rem; box-shadow: 0 10px 24px rgba(15, 23, 42, .3); }}
         .full {{ grid-column: span 12; }}
         h1, h2 {{ margin: 0 0 .7rem 0; }}
-        a {{ color: #93c5fd; }}
+        h1 {{ font-size: 1.45rem; }}
+        a {{ color: var(--primary); text-underline-offset: 2px; }}
         table {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
-        th, td {{ border-bottom: 1px solid #1f2937; padding: .45rem; text-align: left; vertical-align: top; }}
-        th {{ color: #93c5fd; }}
-        code {{ color: #bfdbfe; }}
-        pre {{ max-height: 260px; overflow: auto; background: #020617; border: 1px solid #1f2937; padding: .7rem; border-radius: 8px; white-space: pre-wrap; }}
+        th, td {{ border-bottom: 1px solid var(--card-border); padding: .5rem; text-align: left; vertical-align: top; }}
+        th {{ color: var(--primary); position: sticky; top: 0; background: #0f172a; z-index: 1; }}
+        tr:nth-child(even) td {{ background: rgba(30, 41, 59, .25); }}
+        code {{ color: var(--secondary); font-size: .82rem; }}
+        pre {{ max-height: 260px; overflow: auto; background: #020617; border: 1px solid var(--card-border); padding: .7rem; border-radius: 8px; white-space: pre-wrap; }}
         details.log-card {{ margin: .5rem 0 .7rem 0; }}
-        summary {{ cursor: pointer; color: #93c5fd; font-weight: 600; }}
-        .muted {{ color: #94a3b8; font-size: .85rem; margin-top: .4rem; }}
+        summary {{ cursor: pointer; color: var(--primary); font-weight: 600; }}
+        .muted {{ color: var(--muted); font-size: .85rem; margin-top: .4rem; }}
+        .table-wrap {{ max-height: 380px; overflow: auto; border: 1px solid var(--card-border); border-radius: 8px; }}
+        .routes {{ margin-top: .5rem; line-height: 1.5; }}
     </style>
 </head>
 <body>
-    <h1>Runtime Ops Dashboard</h1>
-    <div class=\"muted\">Streamlined live view for processes and logs. Auto refresh every {AUTO_REFRESH_SECONDS}s.</div>
-    <div class=\"muted\">Paths: <a href=\"/\">/</a>, <a href=\"/dashboard\">/dashboard</a>, <a href=\"/ui\">/ui</a>, <a href=\"/ui/dashboard\">/ui/dashboard</a>{f', base path prefix: {html.escape(UI_BASE_PATH)}' if UI_BASE_PATH else ''}</div>
+    <header class=\"header\">
+        <div>
+            <h1>Runtime Ops Dashboard</h1>
+            <div class=\"muted\">Live view for processes and logs.</div>
+        </div>
+        <div class=\"header-right\">
+            <span class=\"pill\">Auto refresh: {AUTO_REFRESH_SECONDS}s</span>
+            <div class=\"muted routes\">Paths: <a href=\"/\">/</a>, <a href=\"/dashboard\">/dashboard</a>, <a href=\"/ui\">/ui</a>, <a href=\"/ui/dashboard\">/ui/dashboard</a>{f', base path prefix: {html.escape(UI_BASE_PATH)}' if UI_BASE_PATH else ''}</div>
+        </div>
+    </header>
+
+    <section class=\"stats\">
+        <article class=\"stat\"><div class=\"label\">Processes</div><div class=\"value\">{len(processes)}</div></article>
+        <article class=\"stat\"><div class=\"label\">Log Files</div><div class=\"value\">{len(logs)}</div></article>
+        <article class=\"stat\"><div class=\"label\">Combined CPU%</div><div class=\"value\">{total_cpu:.1f}</div></article>
+        <article class=\"stat\"><div class=\"label\">Combined Memory MB</div><div class=\"value\">{total_memory_mb:.2f}</div></article>
+        <article class=\"stat\"><div class=\"label\">Top Process</div><div class=\"value\">{html.escape(heavy_process['name']) if heavy_process else 'N/A'}</div></article>
+    </section>
 
     <div class=\"grid\">
         <section class=\"card full\">
             <h2>Processes ({len(processes)})</h2>
-            <table>
-                <thead><tr><th>PID</th><th>Name</th><th>Status</th><th>CPU%</th><th>Memory MB</th><th>Command</th></tr></thead>
-                <tbody>{process_rows}</tbody>
-            </table>
+            <div class=\"table-wrap\">
+                <table>
+                    <thead><tr><th>PID</th><th>Name</th><th>Status</th><th>CPU%</th><th>Memory MB</th><th>Command</th></tr></thead>
+                    <tbody>{process_rows}</tbody>
+                </table>
+            </div>
         </section>
 
         <section class=\"card full\">
