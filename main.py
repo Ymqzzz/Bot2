@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 import math
-from statistics import NormalDist
+from statistics import NormalDist, fmean, pstdev
 import time
 from typing import Any
 
@@ -25,6 +25,7 @@ MIN_PLAN_EVR = 0.2
 daily_trade_budget: dict[str, int] = {"trades_opened_today": 0}
 spread_cache: dict[str, float] = {}
 spread_history: defaultdict[str, list[tuple[float, float]]] = defaultdict(list)
+strategy_return_history: deque[float] = deque(maxlen=252)
 
 
 def safe_get(*_args, **_kwargs):
@@ -205,7 +206,18 @@ def compute_day_realized_pnl() -> float:
 
 
 def strategy_sharpe() -> float:
-    return 0.0
+    returns = list(strategy_return_history)
+    if len(returns) < 2:
+        return 0.0
+    risk_free_daily = 0.02 / 252.0
+    excess = [r - risk_free_daily for r in returns]
+    vol = pstdev(excess)
+    if vol <= 1e-9:
+        return 0.0
+    annualized = (fmean(excess) / vol) * math.sqrt(252.0)
+    # Shrink toward zero when sample size is small to avoid unstable estimates.
+    sample_weight = min(1.0, len(returns) / 63.0)
+    return float(annualized * sample_weight)
 
 
 def build_market_snapshot(instrument: str) -> dict[str, Any]:
