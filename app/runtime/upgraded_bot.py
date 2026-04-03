@@ -30,6 +30,8 @@ from app.ml.rl_modes import RLMode
 from app.ml.state_builder import NormalizationStats, StateBuilder
 from app.strategy.plugins.breakout_plugin import BreakoutPlugin
 from app.strategy.plugins.mean_reversion_plugin import MeanReversionPlugin
+from app.strategy.plugins.momentum_pulse_plugin import MomentumPulsePlugin
+from app.strategy.plugins.pullback_reclaim_plugin import PullbackReclaimPlugin
 from app.strategy.plugins.trend_plugin import TrendPlugin
 
 
@@ -51,6 +53,8 @@ class UpgradedBot:
         self.registry.register(TrendPlugin())
         self.registry.register(MeanReversionPlugin())
         self.registry.register(BreakoutPlugin())
+        self.registry.register(MomentumPulsePlugin())
+        self.registry.register(PullbackReclaimPlugin())
         event_repo = create_event_repository(self.settings.monitoring_events_db_url)
         self.events = EventBus(repository=event_repo, cache_size=self.settings.monitoring_cache_size)
         self.audit = AuditSink()

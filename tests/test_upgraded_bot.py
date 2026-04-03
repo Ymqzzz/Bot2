@@ -24,6 +24,7 @@ class DummyMarketData:
 
 def test_upgraded_bot_generates_approved_decision():
     bot = UpgradedBot()
+    assert len(bot.registry.plugins) >= 5
     market = DummyMarketData()
     ctx = BrokerContext(nav=100_000.0, open_positions=[], corr_matrix={})
 
