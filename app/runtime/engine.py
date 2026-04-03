@@ -87,49 +87,13 @@ class RuntimeCoordinator:
         self.store = store
 
     def run_cycle(self, cycle_input: RuntimeCycleInput, snapshot: RuntimeSnapshot) -> RuntimeCycleResult:
-        # data ingest
         snapshot.timestamp = datetime.now(timezone.utc)
-
-        # candidate generation
         candidates = self.trade_intel.generate_candidates(cycle_input, snapshot)
-
-        # policy/risk/governance gates
-        control_plane_state = self.control_plane.evaluate(cycle_input, snapshot, candidates)
-        governance_state = self.research_core.review(cycle_input, snapshot, candidates, control_plane_state)
-
-        approved_ids = set(control_plane_state.get("approved_candidate_ids", []))
-        rejected_by_research = set(governance_state.get("rejected_candidate_ids", []))
-        approved_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.get("candidate_id") in approved_ids and candidate.get("candidate_id") not in rejected_by_research
-        ]
-
-        # execution plan
-        execution_plan = {
-            "asof": snapshot.timestamp.isoformat(),
-            "approved_candidate_ids": [candidate.get("candidate_id") for candidate in approved_candidates],
-            "tactics": control_plane_state.get("tactics", {}),
-            "governance": governance_state,
-        }
-
-        # event/audit persistence
+        control_plane_state, governance_state = self._evaluate_gates(cycle_input, snapshot, candidates)
+        approved_candidates = self._build_approved_candidates(candidates, control_plane_state, governance_state)
+        execution_plan = self._build_execution_plan(snapshot, approved_candidates, control_plane_state, governance_state)
         persisted = self.store.persist_cycle(
-            {
-                "snapshot": {
-                    "timestamp": snapshot.timestamp.isoformat(),
-                    "equity": snapshot.equity,
-                    "pnl": snapshot.pnl,
-                    "open_risk": snapshot.open_risk,
-                    "session": snapshot.session,
-                    "regime": snapshot.regime,
-                    "health_scores": snapshot.health_scores,
-                },
-                "candidates": candidates,
-                "control_plane": control_plane_state,
-                "research_core": governance_state,
-                "execution_plan": execution_plan,
-            }
+            self._build_persistence_payload(snapshot, candidates, control_plane_state, governance_state, execution_plan)
         )
 
         return RuntimeCycleResult(
@@ -139,6 +103,73 @@ class RuntimeCoordinator:
             execution_plan=execution_plan,
             persisted_records=persisted,
         )
+
+    def _evaluate_gates(
+        self,
+        cycle_input: RuntimeCycleInput,
+        snapshot: RuntimeSnapshot,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        control_plane_state = self.control_plane.evaluate(cycle_input, snapshot, candidates)
+        governance_state = self.research_core.review(cycle_input, snapshot, candidates, control_plane_state)
+        return control_plane_state, governance_state
+
+    def _build_approved_candidates(
+        self,
+        candidates: list[dict[str, Any]],
+        control_plane_state: dict[str, Any],
+        governance_state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        approved_ids = set(control_plane_state.get("approved_candidate_ids", []))
+        rejected_by_research = set(governance_state.get("rejected_candidate_ids", []))
+
+        return [
+            candidate
+            for candidate in candidates
+            if self._candidate_id(candidate) in approved_ids and self._candidate_id(candidate) not in rejected_by_research
+        ]
+
+    def _build_execution_plan(
+        self,
+        snapshot: RuntimeSnapshot,
+        approved_candidates: list[dict[str, Any]],
+        control_plane_state: dict[str, Any],
+        governance_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "asof": snapshot.timestamp.isoformat(),
+            "approved_candidate_ids": [self._candidate_id(candidate) for candidate in approved_candidates],
+            "tactics": control_plane_state.get("tactics", {}),
+            "governance": governance_state,
+        }
+
+    def _build_persistence_payload(
+        self,
+        snapshot: RuntimeSnapshot,
+        candidates: list[dict[str, Any]],
+        control_plane_state: dict[str, Any],
+        governance_state: dict[str, Any],
+        execution_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "snapshot": {
+                "timestamp": snapshot.timestamp.isoformat(),
+                "equity": snapshot.equity,
+                "pnl": snapshot.pnl,
+                "open_risk": snapshot.open_risk,
+                "session": snapshot.session,
+                "regime": snapshot.regime,
+                "health_scores": snapshot.health_scores,
+            },
+            "candidates": candidates,
+            "control_plane": control_plane_state,
+            "research_core": governance_state,
+            "execution_plan": execution_plan,
+        }
+
+    @staticmethod
+    def _candidate_id(candidate: dict[str, Any]) -> str | None:
+        return candidate.get("candidate_id")
 
 
 class JsonlEventAuditStore:
