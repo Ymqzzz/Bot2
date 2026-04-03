@@ -94,3 +94,14 @@ def test_strict_quality_gate_blocks_trades_when_configured(monkeypatch):
 
     assert not ok_event and reason_event == "Event"
     assert not ok_spread and reason_spread == "Spread"
+
+
+def test_strategy_sharpe_positive_for_consistent_positive_returns(monkeypatch):
+    series = [0.0015 + ((i % 3) - 1) * 0.0002 for i in range(80)]
+    monkeypatch.setattr(main, "strategy_return_history", __import__("collections").deque(series, maxlen=252))
+    assert main.strategy_sharpe() > 0.0
+
+
+def test_strategy_sharpe_returns_zero_for_insufficient_history(monkeypatch):
+    monkeypatch.setattr(main, "strategy_return_history", __import__("collections").deque([0.002], maxlen=252))
+    assert main.strategy_sharpe() == 0.0
