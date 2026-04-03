@@ -24,6 +24,7 @@ from app.strategy.registry import StrategyRegistry
 from app.ml.action_space import MetaAction
 from app.ml.config import DEFAULT_ML_CONFIG
 from app.ml.inference_service import InferenceService
+from app.ml.pair_selector import PairSelectionModel
 from app.ml.replay_store import ReplayStore
 from app.ml.rl_modes import RLMode
 from app.ml.state_builder import NormalizationStats, StateBuilder
@@ -64,6 +65,7 @@ class UpgradedBot:
         self.ml_config = DEFAULT_ML_CONFIG
         self.state_builder = StateBuilder(NormalizationStats(version="v1", mean={}, std={}))
         self.inference = InferenceService(self.ml_config, ReplayStore(self.ml_config.replay_store_path))
+        self.pair_selector = PairSelectionModel()
 
     def _refresh_governor_state(self, broker_ctx: BrokerContext) -> dict[str, float]:
         state = self.gov_state
@@ -188,6 +190,7 @@ class UpgradedBot:
             return []
 
         decisions = []
+        pair_rank_inputs: list[tuple[int, float]] = []
         for instrument in self.settings.instruments:
             bars = market_data.get_recent_bars(instrument, self.settings.granularity, count=150)
             if len(bars) < 40:
@@ -292,6 +295,17 @@ class UpgradedBot:
             best_idx = cands.index(best)
             intel_snapshot = intel_by_idx[best_idx]
             best.score = intel_snapshot.calibration.calibrated_confidence
+            ml_payload = {
+                "confidence": best.score,
+                "confluence": float(feats.get("confluence", 0.0)),
+                "setup_recent_perf": float(feats.get("setup_recent_perf", 0.0)),
+                "instrument_recent_perf": float(feats.get("instrument_recent_perf", 0.0)),
+                "spread_norm": spread_pctile / max(self.settings.max_spread_pctile, 1.0),
+                "volatility_burst": float(feats.get("volatility_burst", 0.0)),
+                "previous_entry_quality": float(intel_snapshot.trade_quality.trade_quality_score),
+            }
+            ml_signal = self.pair_selector.score(instrument, ml_payload)
+            best.score = max(0.0, min(1.0, best.score * (0.65 + 0.35 * ml_signal.trade_likelihood)))
 
             now = time.time()
             if now - self._last_trade_ts < self.settings.min_trade_interval_sec:
@@ -331,7 +345,7 @@ class UpgradedBot:
                     nav=broker_ctx.nav,
                     corr_matrix=broker_ctx.corr_matrix,
                 ),
-                min_score=self.settings.min_signal_score,
+                min_score=max(0.05, self.settings.min_signal_score * (1.2 - 0.4 * ml_signal.trade_likelihood)),
                 max_spread_pctile=self.settings.max_spread_pctile,
                 daily_risk_pct=self.settings.risk_budget_daily,
                 cluster_risk_pct=self.settings.cluster_risk_cap,
@@ -356,9 +370,23 @@ class UpgradedBot:
             }
             decision["regime"] = regime
             decision["market_intelligence"] = intel_snapshot.to_dict()
+            decision["ml_pair_selection"] = {
+                "trade_likelihood": ml_signal.trade_likelihood,
+                "pair_score": ml_signal.pair_score,
+                "expected_result": ml_signal.expected_result,
+                "estimated_sharpe_improvement": ml_signal.sharpe_improvement,
+                "baseline_sharpe": self.pair_selector.baseline_sharpe(),
+            }
             decision["dislocation"] = disloc
             decision["data_quality_status"] = quality.status
             decision["data_quality_reason_codes"] = quality.reason_codes
+            realized_proxy = (
+                0.5 * float(feats.get("instrument_recent_perf", 0.0))
+                + 0.3 * float(feats.get("setup_recent_perf", 0.0))
+                + 0.2 * float(feats.get("confluence", 0.0))
+            )
+            self.pair_selector.learn(instrument, ml_payload, realized_result=realized_proxy)
+            pair_rank_inputs.append((len(decisions), ml_signal.pair_score))
             if decision.get("approved"):
                 self._last_trade_ts = now
                 self.gov_state.trades_today += 1
@@ -371,4 +399,10 @@ class UpgradedBot:
                 }
             )
             decisions.append(decision)
+        ranked_positions = {idx: rank + 1 for rank, (idx, _) in enumerate(sorted(pair_rank_inputs, key=lambda x: x[1], reverse=True))}
+        for idx, decision in enumerate(decisions):
+            rank = ranked_positions.get(idx)
+            if rank is None:
+                continue
+            decision.setdefault("ml_pair_selection", {})["pair_rank"] = rank
         return decisions
