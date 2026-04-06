@@ -12,6 +12,16 @@ from app.intelligence.institutional.schemas import (
 
 
 class ThesisFamilyModel:
+    _AREA_SPECIALTIES: dict[str, str] = {
+        "trend_following": "directional continuation and pullback entries",
+        "mean_reversion": "exhaustion fades back toward value",
+        "liquidity_sweep": "stop-hunt reclaims and liquidity trap reversals",
+        "breakout_continuation": "range expansion and momentum follow-through",
+        "event_reaction": "macro catalyst repricing and post-news dislocations",
+        "volatility_expansion": "volatility regime expansion and dispersion bursts",
+        "other": "cross-regime tactical opportunism",
+    }
+
     def family_of(self, strategy_name: str) -> str:
         s = strategy_name.lower()
         if "trend" in s:
@@ -28,8 +38,14 @@ class ThesisFamilyModel:
             return "volatility_expansion"
         return "other"
 
+    def specialty_of(self, family: str) -> str:
+        return self._AREA_SPECIALTIES.get(family, self._AREA_SPECIALTIES["other"])
+
 
 class FamilyConfidenceAggregator:
+    def __init__(self) -> None:
+        self._family_model = ThesisFamilyModel()
+
     def aggregate(self, votes: list[ThesisVote]) -> list[FamilyConsensus]:
         grouped: dict[str, list[ThesisVote]] = defaultdict(list)
         for vote in votes:
@@ -69,6 +85,7 @@ class FamilyConfidenceAggregator:
                     confidence=conf,
                     disagreement=min(1.0, disagreement),
                     voters=len(family_votes),
+                    area_specialty=self._family_model.specialty_of(family),
                 )
             )
 
