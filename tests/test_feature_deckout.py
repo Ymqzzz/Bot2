@@ -33,9 +33,23 @@ def test_compute_price_features_emits_rich_runtime_keys() -> None:
         "chop_regime",
         "confluence",
         "confidence",
+        "trend_alignment",
+        "trend_consistency",
+        "reversion_pressure",
+        "breakout_pressure",
+        "range_compression",
+        "impulse_strength",
+        "pullback_quality",
     ):
         assert key in feats
 
     assert 0.0 <= feats["confidence"] <= 1.0
     assert 0.0 <= feats["trend_regime"] <= 1.0
     assert 0.0 <= feats["chop_regime"] <= 1.0
+    assert -1.0 <= feats["trend_alignment"] <= 1.0
+    assert 0.0 <= feats["trend_consistency"] <= 1.0
+    assert 0.0 <= feats["reversion_pressure"] <= 1.0
+    assert 0.0 <= feats["breakout_pressure"] <= 1.0
+    assert 0.0 <= feats["range_compression"] <= 1.0
+    assert 0.0 <= feats["impulse_strength"] <= 1.0
+    assert 0.0 <= feats["pullback_quality"] <= 1.0
