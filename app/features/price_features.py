@@ -118,6 +118,13 @@ def compute_price_features(bars: list[dict]) -> dict:
             "price_action_breakout_score": 0.0,
             "price_action_confidence": 0.0,
             "price_action_id": 0.0,
+            "trend_alignment": 0.0,
+            "trend_consistency": 0.0,
+            "reversion_pressure": 0.0,
+            "breakout_pressure": 0.0,
+            "range_compression": 0.0,
+            "impulse_strength": 0.0,
+            "pullback_quality": 0.0,
         }
     ema_fast = _ema(closes[-40:], 10)
     ema_slow = _ema(closes[-60:], 30)
@@ -190,6 +197,13 @@ def compute_price_features(bars: list[dict]) -> dict:
     best_id, best_score = max(pa_scores.items(), key=lambda x: x[1])
     second_score = sorted(pa_scores.values())[-2]
     price_action_confidence = max(0.0, min(1.0, 0.55 + (best_score - second_score)))
+    trend_alignment = max(-1.0, min(1.0, _safe_div(ema_fast - ema_slow, max(2.0 * atr, 1e-9))))
+    trend_consistency = max(0.0, min(1.0, (abs(ret_3) + abs(ret_12)) * 6.0))
+    reversion_pressure = max(0.0, min(1.0, abs(zscore) / 3.0 * (0.6 + 0.4 * chop_regime)))
+    breakout_pressure = max(0.0, min(1.0, abs(ret_1) * 120.0 + 0.45 * trend_regime + 0.2 * bos))
+    range_compression = max(0.0, min(1.0, _safe_div(atr, current_close) * 250.0))
+    impulse_strength = max(0.0, min(1.0, _safe_div(abs(momentum), 2.5) * (0.7 + 0.3 * trend_regime)))
+    pullback_quality = max(0.0, min(1.0, trend_regime * (1.0 - min(1.0, abs(zscore) / 2.2))))
 
     return {
         "ema_fast": ema_fast,
@@ -220,4 +234,11 @@ def compute_price_features(bars: list[dict]) -> dict:
         "price_action_breakout_score": price_action_breakout_score,
         "price_action_confidence": price_action_confidence,
         "price_action_id": best_id,
+        "trend_alignment": trend_alignment,
+        "trend_consistency": trend_consistency,
+        "reversion_pressure": reversion_pressure,
+        "breakout_pressure": breakout_pressure,
+        "range_compression": range_compression,
+        "impulse_strength": impulse_strength,
+        "pullback_quality": pullback_quality,
     }
