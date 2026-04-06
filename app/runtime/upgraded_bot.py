@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import fsum
+from statistics import fmean
 import time
 
 from app.config.settings import BotSettings
 from app.data.quality import validate_bars_quality
+from app.execution.scheduling import build_clip_plan
+from app.execution.routing import choose_order_type
 from app.config.validation import validate_settings
 from app.features.price_features import compute_price_features
 from app.governance.decision_graph import DecisionGraph
@@ -70,6 +74,44 @@ class UpgradedBot:
         self.state_builder = StateBuilder(NormalizationStats(version="v1", mean={}, std={}))
         self.inference = InferenceService(self.ml_config, ReplayStore(self.ml_config.replay_store_path))
         self.pair_selector = PairSelectionModel()
+
+    @staticmethod
+    def _bounded_score(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _realized_proxy(feats: dict) -> float:
+        weighted_terms = (
+            0.5 * float(feats.get("instrument_recent_perf", 0.0)),
+            0.3 * float(feats.get("setup_recent_perf", 0.0)),
+            0.2 * float(feats.get("confluence", 0.0)),
+        )
+        return fsum(weighted_terms)
+
+    @staticmethod
+    def _stage_clip_plan(signed_units: int, liquidity_factor: float, has_near_event: bool) -> list[int]:
+        if signed_units == 0:
+            return []
+        unsigned_plan = build_clip_plan(abs(signed_units), liquidity_factor, has_near_event)
+        sign = 1 if signed_units > 0 else -1
+        return [sign * qty for qty in unsigned_plan if qty > 0]
+
+    def _composite_confidence(
+        self,
+        base_confidence: float,
+        quality_score: float,
+        ranking_penalty: float,
+        ml_trade_likelihood: float,
+    ) -> float:
+        quality_adjusted = self._bounded_score(base_confidence * (0.75 + 0.25 * quality_score))
+        uncertainty_adjusted = self._bounded_score(quality_adjusted * (1.0 - 0.25 * ranking_penalty))
+        blended = fsum(
+            (
+                0.70 * uncertainty_adjusted,
+                0.30 * self._bounded_score(base_confidence * ml_trade_likelihood),
+            )
+        )
+        return self._bounded_score(blended)
 
     def _refresh_governor_state(self, broker_ctx: BrokerContext) -> dict[str, float]:
         state = self.gov_state
@@ -272,30 +314,6 @@ class UpgradedBot:
             if best is None:
                 continue
 
-            intel_snapshot = self.intelligence.build_snapshot(
-                instrument=instrument,
-                bars=bars,
-                features={**feats, "spread_percentile": spread_pctile, "atr_percentile": float(feats.get("atr", 0.5))},
-                context={
-                    "trace_id": trace,
-                    "near_event": near_event,
-                    "minutes_to_event": 30.0 if near_event else 9999.0,
-                    "minutes_since_event": 9999.0,
-                    "event_severity": 0.8 if near_event else 0.0,
-                    "event_relevance": 0.8 if near_event else 0.0,
-                    "slippage_percentile": 0.25,
-                    "execution_cost": spread_pctile / 100.0,
-                    "strategy_performance": {},
-                    "cross_asset": {},
-                    "analog_history": [],
-                },
-                candidate_strategy=best.strategy,
-                raw_confidence=best.score,
-            )
-            refined_score = intel_snapshot.calibration.calibrated_confidence
-            refined_score *= (0.75 + 0.25 * intel_snapshot.trade_quality.quality_score)
-            refined_score *= (1.0 - 0.25 * intel_snapshot.uncertainty.ranking_penalty)
-            best.score = max(0.0, min(1.0, refined_score))
             best_idx = cands.index(best)
             intel_snapshot = intel_by_idx[best_idx]
             best.score = intel_snapshot.calibration.calibrated_confidence
@@ -309,7 +327,12 @@ class UpgradedBot:
                 "previous_entry_quality": float(intel_snapshot.trade_quality.trade_quality_score),
             }
             ml_signal = self.pair_selector.score(instrument, ml_payload)
-            best.score = max(0.0, min(1.0, best.score * (0.65 + 0.35 * ml_signal.trade_likelihood)))
+            best.score = self._composite_confidence(
+                base_confidence=best.score,
+                quality_score=intel_snapshot.trade_quality.quality_score,
+                ranking_penalty=intel_snapshot.uncertainty.ranking_penalty,
+                ml_trade_likelihood=ml_signal.trade_likelihood,
+            )
 
             now = time.time()
             if now - self._last_trade_ts < self.settings.min_trade_interval_sec:
@@ -384,11 +407,15 @@ class UpgradedBot:
             decision["dislocation"] = disloc
             decision["data_quality_status"] = quality.status
             decision["data_quality_reason_codes"] = quality.reason_codes
-            realized_proxy = (
-                0.5 * float(feats.get("instrument_recent_perf", 0.0))
-                + 0.3 * float(feats.get("setup_recent_perf", 0.0))
-                + 0.2 * float(feats.get("confluence", 0.0))
+            decision["execution_clip_plan"] = self._stage_clip_plan(sizing.signed_units, liq, near_event)
+            decision["quality_modifier_mean"] = fmean(quality_modifiers.values()) if quality_modifiers else 0.0
+            decision["execution_order_type"] = choose_order_type(
+                strategy=best.strategy,
+                breakout_mag=float(feats.get("breakout_mag", 0.0)),
+                liquidity_factor=liq,
+                spread_pctile=spread_pctile,
             )
+            realized_proxy = self._realized_proxy(feats)
             self.pair_selector.learn(instrument, ml_payload, realized_result=realized_proxy)
             pair_rank_inputs.append((len(decisions), ml_signal.pair_score))
             if decision.get("approved"):

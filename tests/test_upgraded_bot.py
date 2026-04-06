@@ -35,6 +35,9 @@ def test_upgraded_bot_generates_approved_decision():
     approved = next(d for d in decisions if d.get("approved"))
     assert "sizing" in approved
     assert approved["proposal"]["signed_units"] != 0
+    assert isinstance(approved.get("execution_clip_plan"), list)
+    assert approved.get("execution_order_type")
+    assert "quality_modifier_mean" in approved
     assert bot.events.events
 
 
