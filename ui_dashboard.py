@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import os
 from pathlib import Path
+import random
+from statistics import pstdev
 from typing import Any
 
 import psutil
@@ -104,12 +106,160 @@ def _collect_processes() -> list[dict[str, Any]]:
     return processes
 
 
+def _scale_values(values: list[float], height: int) -> list[float]:
+    if not values:
+        return []
+    max_value = max(values)
+    if max_value <= 0:
+        return [0.0 for _ in values]
+    return [round((value / max_value) * height, 2) for value in values]
+
+
+def _bar_chart_svg(labels: list[str], values: list[float], width: int = 920, height: int = 280) -> str:
+    if not labels or not values:
+        return "<div class='muted'>No process metrics available for bar chart.</div>"
+    bars = min(len(values), 8)
+    labels = labels[:bars]
+    values = values[:bars]
+    left_pad = 24
+    bottom_pad = 44
+    top_pad = 20
+    chart_h = height - bottom_pad - top_pad
+    chart_w = width - left_pad - 12
+    bar_step = chart_w / bars
+    bar_w = max(16.0, bar_step * 0.55)
+    scaled = _scale_values(values, chart_h)
+
+    bar_nodes: list[str] = []
+    label_nodes: list[str] = []
+    for idx, metric in enumerate(scaled):
+        x = left_pad + (idx * bar_step) + (bar_step - bar_w) / 2
+        y = top_pad + (chart_h - metric)
+        label = html.escape(labels[idx][:16])
+        bar_nodes.append(
+            f"<rect x='{x:.2f}' y='{y:.2f}' width='{bar_w:.2f}' height='{metric:.2f}' rx='5' fill='url(#cpuBarGradient)' />"
+            f"<text x='{x + (bar_w / 2):.2f}' y='{max(y - 8, 12):.2f}' text-anchor='middle' class='svg-value'>{values[idx]:.1f}%</text>"
+        )
+        label_nodes.append(
+            f"<text x='{x + (bar_w / 2):.2f}' y='{height - 16}' text-anchor='middle' class='svg-label'>{label}</text>"
+        )
+
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Top process CPU load bar chart'>"
+        "<defs><linearGradient id='cpuBarGradient' x1='0%' x2='0%' y1='0%' y2='100%'>"
+        "<stop offset='0%' stop-color='#60a5fa'/><stop offset='100%' stop-color='#1d4ed8'/></linearGradient></defs>"
+        f"<rect x='{left_pad}' y='{top_pad}' width='{chart_w:.2f}' height='{chart_h}' fill='#0b1529' stroke='#253047' rx='8'/>"
+        + "".join(bar_nodes)
+        + "".join(label_nodes)
+        + "</svg>"
+    )
+
+
+def _line_chart_svg(labels: list[str], values: list[float], width: int = 920, height: int = 280) -> str:
+    if len(values) < 2:
+        return "<div class='muted'>Need at least two data points for line chart.</div>"
+    left_pad = 24
+    bottom_pad = 44
+    top_pad = 20
+    chart_h = height - bottom_pad - top_pad
+    chart_w = width - left_pad - 12
+    denom = max(1, len(values) - 1)
+    scaled = _scale_values(values, chart_h)
+    pts: list[tuple[float, float]] = []
+    for idx, metric in enumerate(scaled):
+        x = left_pad + (idx / denom) * chart_w
+        y = top_pad + (chart_h - metric)
+        pts.append((x, y))
+
+    line_path = " ".join(f"{x:.2f},{y:.2f}" for x, y in pts)
+    markers = "".join(f"<circle cx='{x:.2f}' cy='{y:.2f}' r='3.4' fill='#93c5fd' />" for x, y in pts)
+    label_nodes = "".join(
+        f"<text x='{left_pad + (idx / denom) * chart_w:.2f}' y='{height - 16}' text-anchor='middle' class='svg-label'>{html.escape(labels[idx][:16])}</text>"
+        for idx in range(len(labels))
+    )
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Log size trend line chart'>"
+        f"<rect x='{left_pad}' y='{top_pad}' width='{chart_w:.2f}' height='{chart_h}' fill='#0b1529' stroke='#253047' rx='8'/>"
+        f"<polyline fill='none' stroke='#22d3ee' stroke-width='3' points='{line_path}' />"
+        f"{markers}{label_nodes}</svg>"
+    )
+
+
+def _simulate_monte_carlo(
+    base_value: float,
+    dispersion: float,
+    trials: int = 500,
+    steps: int = 20,
+) -> list[float]:
+    rng = random.Random(42)
+    simulations: list[float] = []
+    sigma = max(0.001, dispersion)
+    drift = 0.0015
+    for _ in range(trials):
+        value = max(1.0, base_value)
+        for _ in range(steps):
+            shock = rng.gauss(drift, sigma)
+            value *= max(0.85, 1.0 + shock)
+        simulations.append(value)
+    simulations.sort()
+    return simulations
+
+
+def _monte_carlo_svg(simulations: list[float], width: int = 920, height: int = 280) -> str:
+    if not simulations:
+        return "<div class='muted'>No data available for Monte Carlo simulation.</div>"
+    bins = 24
+    min_v = min(simulations)
+    max_v = max(simulations)
+    span = max(1e-6, max_v - min_v)
+    counts = [0 for _ in range(bins)]
+    for value in simulations:
+        idx = min(bins - 1, int(((value - min_v) / span) * bins))
+        counts[idx] += 1
+
+    left_pad = 24
+    bottom_pad = 40
+    top_pad = 20
+    chart_h = height - bottom_pad - top_pad
+    chart_w = width - left_pad - 12
+    scaled = _scale_values([float(c) for c in counts], chart_h)
+    step = chart_w / bins
+    bar_w = max(6.0, step * 0.75)
+    bars = "".join(
+        f"<rect x='{left_pad + idx * step + (step - bar_w) / 2:.2f}' y='{top_pad + chart_h - value:.2f}' width='{bar_w:.2f}' height='{value:.2f}' rx='3' fill='#34d399' opacity='0.88'/>"
+        for idx, value in enumerate(scaled)
+    )
+    p05 = simulations[max(0, int(len(simulations) * 0.05) - 1)]
+    p50 = simulations[int(len(simulations) * 0.5)]
+    p95 = simulations[min(len(simulations) - 1, int(len(simulations) * 0.95))]
+
+    return (
+        f"<svg viewBox='0 0 {width} {height}' role='img' aria-label='Monte Carlo distribution histogram'>"
+        f"<rect x='{left_pad}' y='{top_pad}' width='{chart_w:.2f}' height='{chart_h}' fill='#0b1529' stroke='#253047' rx='8'/>"
+        f"{bars}"
+        f"<text x='{left_pad + 12}' y='{height - 14}' class='svg-label'>P05 {p05:.2f}</text>"
+        f"<text x='{width / 2:.2f}' y='{height - 14}' text-anchor='middle' class='svg-label'>Median {p50:.2f}</text>"
+        f"<text x='{width - 18}' y='{height - 14}' text-anchor='end' class='svg-label'>P95 {p95:.2f}</text>"
+        "</svg>"
+    )
+
+
 def dashboard() -> str:
     logs = _collect_logs()
     processes = _collect_processes()
     total_cpu = sum(process["cpu_percent"] for process in processes)
     total_memory_mb = sum(process["memory_mb"] for process in processes)
     heavy_process = processes[0] if processes else None
+    top_processes = processes[:8]
+    process_labels = [str(item["name"]) for item in top_processes]
+    cpu_values = [float(item["cpu_percent"]) for item in top_processes]
+    log_labels = [item["name"] for item in logs[:10]]
+    log_sizes = [float(item["size_kb"]) for item in logs[:10]]
+    chart_bar = _bar_chart_svg(process_labels, cpu_values)
+    chart_line = _line_chart_svg(log_labels, log_sizes)
+    cpu_dispersion = pstdev(cpu_values) / 100.0 if len(cpu_values) > 1 else 0.02
+    mc_samples = _simulate_monte_carlo(max(total_cpu, 1.0), cpu_dispersion, trials=700, steps=18)
+    chart_mc = _monte_carlo_svg(mc_samples)
 
     process_rows = "".join(
         f"<tr><td>{p['pid']}</td><td>{html.escape(p['name'])}</td><td>{html.escape(p['status'])}</td><td>{p['cpu_percent']:.1f}</td><td>{p['memory_mb']:.2f}</td><td><code>{html.escape(p['cmdline'])}</code></td></tr>"
@@ -171,6 +321,13 @@ def dashboard() -> str:
         .muted {{ color: var(--muted); font-size: .85rem; margin-top: .4rem; }}
         .table-wrap {{ max-height: 380px; overflow: auto; border: 1px solid var(--card-border); border-radius: 8px; }}
         .routes {{ margin-top: .5rem; line-height: 1.5; }}
+        .chart-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: .8rem; }}
+        .chart-card {{ background: #0b1324; border: 1px solid #22324b; border-radius: 10px; padding: .7rem; }}
+        .chart-card h3 {{ margin: 0 0 .5rem 0; font-size: 1rem; color: #dbeafe; }}
+        .chart-caption {{ margin-top: .35rem; color: var(--muted); font-size: .82rem; }}
+        svg {{ width: 100%; height: auto; display: block; }}
+        .svg-label {{ fill: #9fb4d5; font-size: 11px; }}
+        .svg-value {{ fill: #dbeafe; font-size: 10px; font-weight: 600; }}
     </style>
 </head>
 <body>
@@ -194,6 +351,27 @@ def dashboard() -> str:
     </section>
 
     <div class=\"grid\">
+        <section class=\"card full\">
+            <h2>Quant Visual Analytics</h2>
+            <div class=\"chart-grid\">
+                <article class=\"chart-card\">
+                    <h3>Bar Chart · Top Process CPU Load</h3>
+                    {chart_bar}
+                    <div class=\"chart-caption\">Ranks active processes by CPU%. Helps quants spot runtime bottlenecks in real time.</div>
+                </article>
+                <article class=\"chart-card\">
+                    <h3>Line Chart · Log Size Trend</h3>
+                    {chart_line}
+                    <div class=\"chart-caption\">Tracks log-file size progression across monitored outputs for stability checks.</div>
+                </article>
+                <article class=\"chart-card\">
+                    <h3>Monte Carlo · Runtime Stress Distribution</h3>
+                    {chart_mc}
+                    <div class=\"chart-caption\">Simulates 700 paths using observed CPU dispersion to estimate operating-load tail risk.</div>
+                </article>
+            </div>
+        </section>
+
         <section class=\"card full\">
             <h2>Processes ({len(processes)})</h2>
             <div class=\"table-wrap\">
