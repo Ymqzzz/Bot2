@@ -33,9 +33,19 @@ def test_compute_price_features_emits_rich_runtime_keys() -> None:
         "chop_regime",
         "confluence",
         "confidence",
+        "directional_efficiency",
+        "range_compression",
+        "wick_rejection_bias",
+        "price_action_trend_score",
+        "price_action_mean_revert_score",
+        "price_action_breakout_score",
+        "price_action_confidence",
+        "price_action_id",
     ):
         assert key in feats
 
     assert 0.0 <= feats["confidence"] <= 1.0
     assert 0.0 <= feats["trend_regime"] <= 1.0
     assert 0.0 <= feats["chop_regime"] <= 1.0
+    assert 0.0 <= feats["price_action_confidence"] <= 1.0
+    assert feats["price_action_id"] in {1.0, 2.0, 3.0}

@@ -110,6 +110,14 @@ def compute_price_features(bars: list[dict]) -> dict:
             "chop_regime": 0.5,
             "confluence": 0.0,
             "confidence": 0.0,
+            "directional_efficiency": 0.0,
+            "range_compression": 0.0,
+            "wick_rejection_bias": 0.0,
+            "price_action_trend_score": 0.0,
+            "price_action_mean_revert_score": 0.0,
+            "price_action_breakout_score": 0.0,
+            "price_action_confidence": 0.0,
+            "price_action_id": 0.0,
         }
     ema_fast = _ema(closes[-40:], 10)
     ema_slow = _ema(closes[-60:], 30)
@@ -123,6 +131,8 @@ def compute_price_features(bars: list[dict]) -> dict:
     realized_vol = _realized_vol(closes, window=20)
     trend_slope = _linreg_slope(closes[-20:])
     momentum = _safe_div(closes[-1] - closes[-11], max(atr, 1e-9)) if len(closes) > 11 else 0.0
+    abs_path = sum(abs(closes[i] - closes[i - 1]) for i in range(max(1, len(closes) - 20), len(closes)))
+    directional_efficiency = min(1.0, abs(closes[-1] - closes[-20]) / max(abs_path, 1e-9)) if len(closes) > 20 else 0.0
 
     current_high = highs[-1]
     current_low = lows[-1]
@@ -136,6 +146,13 @@ def compute_price_features(bars: list[dict]) -> dict:
     prev_day_hilo_proximity = _safe_div(min(proximity_hi, proximity_lo), max(atr, 1e-9))
     liquidity_sweep = 1.0 if (current_high > prior_high and current_close < prior_high) or (current_low < prior_low and current_close > prior_low) else 0.0
     bos = 1.0 if (current_close > prior_high or current_close < prior_low) else 0.0
+    bar_ranges = [max(1e-9, h - l) for h, l in zip(highs[-30:], lows[-30:])]
+    recent_range = statistics.fmean(bar_ranges[-8:])
+    baseline_range = statistics.fmean(bar_ranges)
+    range_compression = max(0.0, min(1.0, 1.0 - _safe_div(recent_range, baseline_range, default=1.0)))
+    upper_wick = max(0.0, current_high - max(current_close, float(bars[-1]["open"])))
+    lower_wick = max(0.0, min(current_close, float(bars[-1]["open"])) - current_low)
+    wick_rejection_bias = max(-1.0, min(1.0, _safe_div(lower_wick - upper_wick, current_range, default=0.0)))
 
     trend_strength = min(1.0, abs(ema_fast - ema_slow) / max(2.5 * atr, 1e-9))
     vol_penalty = min(1.0, realized_vol * 100.0)
@@ -143,6 +160,36 @@ def compute_price_features(bars: list[dict]) -> dict:
     trend_regime = max(0.0, min(1.0, 1.0 - chop_regime))
     confluence = max(0.0, min(1.0, 0.5 * trend_regime + 0.3 * (1.0 - min(1.0, abs(zscore) / 4.0)) + 0.2 * (1.0 - vol_penalty)))
     confidence = max(0.0, min(1.0, 0.35 + 0.4 * confluence + 0.25 * trend_regime))
+    impulse = min(1.0, abs(momentum) / 3.0)
+    mean_revert_tension = min(1.0, abs(zscore) / 2.5)
+    price_action_trend_score = max(0.0, min(1.0, 0.45 * directional_efficiency + 0.35 * trend_strength + 0.20 * (1.0 - range_compression)))
+    price_action_mean_revert_score = max(
+        0.0,
+        min(
+            1.0,
+            0.45 * mean_revert_tension
+            + 0.30 * range_compression
+            + 0.25 * (1.0 - directional_efficiency),
+        ),
+    )
+    price_action_breakout_score = max(
+        0.0,
+        min(
+            1.0,
+            0.35 * bos
+            + 0.25 * impulse
+            + 0.20 * directional_efficiency
+            + 0.20 * (1.0 - min(1.0, abs(zscore) / 5.0)),
+        ),
+    )
+    pa_scores = {
+        1.0: price_action_trend_score,
+        2.0: price_action_mean_revert_score,
+        3.0: price_action_breakout_score,
+    }
+    best_id, best_score = max(pa_scores.items(), key=lambda x: x[1])
+    second_score = sorted(pa_scores.values())[-2]
+    price_action_confidence = max(0.0, min(1.0, 0.55 + (best_score - second_score)))
 
     return {
         "ema_fast": ema_fast,
@@ -165,4 +212,12 @@ def compute_price_features(bars: list[dict]) -> dict:
         "chop_regime": chop_regime,
         "confluence": confluence,
         "confidence": confidence,
+        "directional_efficiency": directional_efficiency,
+        "range_compression": range_compression,
+        "wick_rejection_bias": wick_rejection_bias,
+        "price_action_trend_score": price_action_trend_score,
+        "price_action_mean_revert_score": price_action_mean_revert_score,
+        "price_action_breakout_score": price_action_breakout_score,
+        "price_action_confidence": price_action_confidence,
+        "price_action_id": best_id,
     }

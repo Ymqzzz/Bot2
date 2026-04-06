@@ -39,21 +39,28 @@ class FamilyConfidenceAggregator:
         for family, family_votes in grouped.items():
             if not family_votes:
                 continue
-            scores = []
+            scores: list[float] = []
+            strengths: list[float] = []
             for v in family_votes:
                 sign = 1.0 if v.direction == Direction.LONG else -1.0 if v.direction == Direction.SHORT else 0.0
-                scores.append(sign * v.confidence * max(0.05, v.weight))
+                effective_weight = max(0.05, v.weight) * max(0.05, v.confidence)
+                scores.append(sign * effective_weight)
+                strengths.append(effective_weight)
 
-            net = mean(scores)
-            abs_conf = mean(abs(s) for s in scores)
-            disagreement = mean(abs(s - net) for s in scores)
+            total_strength = sum(strengths)
+            if total_strength <= 1e-12:
+                continue
+            net = sum(scores) / total_strength
+            abs_conf = sum(abs(s) for s in scores) / total_strength
+            disagreement = sum(abs(s - net) for s in scores) / total_strength
+            participation_efficiency = min(1.0, total_strength / len(family_votes))
             if net > 0.12:
                 direction = Direction.LONG
             elif net < -0.12:
                 direction = Direction.SHORT
             else:
                 direction = Direction.FLAT
-            conf = max(0.0, min(1.0, abs_conf * (1.0 - min(1.0, disagreement))))
+            conf = max(0.0, min(1.0, abs_conf * (1.0 - min(1.0, disagreement)) * (0.65 + 0.35 * participation_efficiency)))
 
             out.append(
                 FamilyConsensus(
@@ -75,15 +82,18 @@ class InterFamilyConflictEngine:
             return 1.0
 
         values: list[float] = []
+        weights: list[float] = []
         for fc in family_consensus:
             sign = 1.0 if fc.net_direction == Direction.LONG else -1.0 if fc.net_direction == Direction.SHORT else 0.0
             values.append(sign * fc.confidence)
+            weights.append(max(1.0, float(fc.voters)) * max(0.1, fc.confidence))
 
         if len(values) == 1:
             return 0.0
 
-        avg = mean(values)
-        spread = mean(abs(v - avg) for v in values)
+        total_w = sum(weights)
+        avg = sum(v * w for v, w in zip(values, weights)) / max(1e-12, total_w)
+        spread = sum(abs(v - avg) * w for v, w in zip(values, weights)) / max(1e-12, total_w)
         flat_ratio = sum(1 for v in values if abs(v) < 0.08) / len(values)
         return max(0.0, min(1.0, spread * 1.35 + flat_ratio * 0.25))
 
@@ -94,8 +104,10 @@ class ThesisWeightAdapter:
             return 0.0
         top = family_consensus[0].confidence
         avg = mean(f.confidence for f in family_consensus)
-        base = top * 0.6 + avg * 0.4
-        return max(0.0, min(1.0, base * (1.0 - conflict * 0.55)))
+        dominance = max(0.0, top - avg)
+        participation = min(1.0, mean(min(1.0, f.voters / 3.0) for f in family_consensus))
+        base = top * 0.55 + avg * 0.35 + dominance * 0.10
+        return max(0.0, min(1.0, base * (1.0 - conflict * 0.55) * (0.75 + 0.25 * participation)))
 
 
 class EnsembleCoordinator:
