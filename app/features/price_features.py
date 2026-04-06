@@ -110,6 +110,13 @@ def compute_price_features(bars: list[dict]) -> dict:
             "chop_regime": 0.5,
             "confluence": 0.0,
             "confidence": 0.0,
+            "trend_alignment": 0.0,
+            "trend_consistency": 0.0,
+            "reversion_pressure": 0.0,
+            "breakout_pressure": 0.0,
+            "range_compression": 0.0,
+            "impulse_strength": 0.0,
+            "pullback_quality": 0.0,
         }
     ema_fast = _ema(closes[-40:], 10)
     ema_slow = _ema(closes[-60:], 30)
@@ -143,6 +150,13 @@ def compute_price_features(bars: list[dict]) -> dict:
     trend_regime = max(0.0, min(1.0, 1.0 - chop_regime))
     confluence = max(0.0, min(1.0, 0.5 * trend_regime + 0.3 * (1.0 - min(1.0, abs(zscore) / 4.0)) + 0.2 * (1.0 - vol_penalty)))
     confidence = max(0.0, min(1.0, 0.35 + 0.4 * confluence + 0.25 * trend_regime))
+    trend_alignment = max(-1.0, min(1.0, _safe_div(ema_fast - ema_slow, max(2.0 * atr, 1e-9))))
+    trend_consistency = max(0.0, min(1.0, (abs(ret_3) + abs(ret_12)) * 6.0))
+    reversion_pressure = max(0.0, min(1.0, abs(zscore) / 3.0 * (0.6 + 0.4 * chop_regime)))
+    breakout_pressure = max(0.0, min(1.0, abs(ret_1) * 120.0 + 0.45 * trend_regime + 0.2 * bos))
+    range_compression = max(0.0, min(1.0, _safe_div(atr, current_close) * 250.0))
+    impulse_strength = max(0.0, min(1.0, _safe_div(abs(momentum), 2.5) * (0.7 + 0.3 * trend_regime)))
+    pullback_quality = max(0.0, min(1.0, trend_regime * (1.0 - min(1.0, abs(zscore) / 2.2))))
 
     return {
         "ema_fast": ema_fast,
@@ -165,4 +179,11 @@ def compute_price_features(bars: list[dict]) -> dict:
         "chop_regime": chop_regime,
         "confluence": confluence,
         "confidence": confidence,
+        "trend_alignment": trend_alignment,
+        "trend_consistency": trend_consistency,
+        "reversion_pressure": reversion_pressure,
+        "breakout_pressure": breakout_pressure,
+        "range_compression": range_compression,
+        "impulse_strength": impulse_strength,
+        "pullback_quality": pullback_quality,
     }
