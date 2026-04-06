@@ -10,6 +10,9 @@ class PairLearningState:
     entry_count: int = 0
     avg_result: float = 0.0
     m2_result: float = 0.0
+    downside_sum: float = 0.0
+    downside_sq_sum: float = 0.0
+    downside_count: int = 0
     ewma_sharpe: float = 0.0
 
 
@@ -28,6 +31,11 @@ class PairSelectionModel:
     learning_rate: float = 0.05
     l2_penalty: float = 1e-4
     sharpe_window: int = 50
+    bayesian_prior_mean: float = 0.0
+    bayesian_prior_strength: float = 5.0
+    confidence_floor: float = 0.35
+    confidence_sample_scale: float = 30.0
+    downside_penalty_weight: float = 0.30
     _weights: dict[str, float] = field(
         default_factory=lambda: {
             "bias": -0.3,
@@ -57,10 +65,25 @@ class PairSelectionModel:
     def baseline_sharpe(self) -> float:
         if len(self._recent_results) < 5:
             return 0.0
-        mean = sum(self._recent_results) / len(self._recent_results)
-        var = sum((x - mean) ** 2 for x in self._recent_results) / max(1, len(self._recent_results) - 1)
+        mean = self._posterior_mean(sum(self._recent_results) / len(self._recent_results), len(self._recent_results))
+        var = self._sample_variance(self._recent_results)
         std = math.sqrt(max(var, 1e-9))
         return mean / std
+
+    def _sample_variance(self, values: list[float] | deque[float]) -> float:
+        n = len(values)
+        if n <= 1:
+            return 0.0
+        mean = sum(values) / n
+        return sum((x - mean) ** 2 for x in values) / max(1, n - 1)
+
+    def _posterior_mean(self, sample_mean: float, sample_size: int) -> float:
+        weight = sample_size / max(1e-9, sample_size + self.bayesian_prior_strength)
+        return weight * sample_mean + (1.0 - weight) * self.bayesian_prior_mean
+
+    def _confidence_multiplier(self, sample_size: int) -> float:
+        ramp = sample_size / max(1.0, self.confidence_sample_scale)
+        return max(self.confidence_floor, min(1.0, ramp))
 
     def build_feature_map(self, instrument: str, payload: dict[str, float]) -> dict[str, float]:
         state = self._state(instrument)
@@ -81,8 +104,21 @@ class PairSelectionModel:
         logit = sum(self._weights.get(k, 0.0) * v for k, v in feats.items())
         likelihood = self._sigmoid(logit)
         state = self._state(instrument)
-        expected_result = (0.65 * likelihood + 0.35 * state.avg_result)
-        pair_score = max(0.0, min(1.0, 0.55 * likelihood + 0.45 * max(0.0, state.ewma_sharpe)))
+        posterior_avg_result = self._posterior_mean(state.avg_result, state.entry_count)
+        expected_result = (0.65 * likelihood + 0.35 * posterior_avg_result)
+
+        downside_variance = 0.0
+        if state.downside_count > 1:
+            downside_mean = state.downside_sum / state.downside_count
+            downside_variance = max(
+                0.0,
+                (state.downside_sq_sum - state.downside_count * downside_mean * downside_mean) / max(1, state.downside_count - 1),
+            )
+        downside_std = math.sqrt(max(downside_variance, 1e-9))
+        downside_penalty = max(0.0, min(1.0, self.downside_penalty_weight * downside_std))
+        confidence_multiplier = self._confidence_multiplier(state.entry_count)
+        pair_score_raw = confidence_multiplier * (0.55 * likelihood + 0.45 * max(0.0, state.ewma_sharpe))
+        pair_score = max(0.0, min(1.0, pair_score_raw - downside_penalty))
         sharpe_improvement = max(-2.0, min(2.0, state.ewma_sharpe - self.baseline_sharpe()))
         return PairModelSignal(
             trade_likelihood=likelihood,
@@ -104,8 +140,13 @@ class PairSelectionModel:
         delta = realized_result - state.avg_result
         state.avg_result += delta / max(1, state.entry_count)
         state.m2_result += delta * (realized_result - state.avg_result)
+        if realized_result < 0.0:
+            state.downside_count += 1
+            state.downside_sum += realized_result
+            state.downside_sq_sum += realized_result * realized_result
         variance = state.m2_result / max(1, state.entry_count - 1)
         std = math.sqrt(max(variance, 1e-9))
-        current_sharpe = state.avg_result / std if state.entry_count > 1 else 0.0
+        posterior_mean = self._posterior_mean(state.avg_result, state.entry_count)
+        current_sharpe = posterior_mean / std if state.entry_count > 1 else 0.0
         state.ewma_sharpe = 0.9 * state.ewma_sharpe + 0.1 * current_sharpe
         self._recent_results.append(realized_result)
