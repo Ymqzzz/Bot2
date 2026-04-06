@@ -388,6 +388,7 @@ class FamilyConsensus:
     confidence: float
     disagreement: float
     voters: int
+    area_specialty: str = "general_opportunity_scanning"
 
 
 @dataclass(frozen=True)
