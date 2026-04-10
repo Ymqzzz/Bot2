@@ -75,3 +75,60 @@ def test_thesis_family_model_exposes_area_specialty_for_each_family() -> None:
         specialty = model.specialty_of(family)
         assert isinstance(specialty, str)
         assert specialty
+
+
+def test_regime_engine_applies_multimarket_risk_off_overlay() -> None:
+    engine = RegimeEngine()
+    snapshot = engine.compute(
+        EngineInput(
+            timestamp=datetime(2026, 1, 1),
+            instrument="EURUSD",
+            trace_id="trace-mm-riskoff",
+            bars=[],
+            context={
+                "near_event": False,
+                "multi_market": {
+                    "dxy_change": 0.007,
+                    "us10y_change_bps": 11.0,
+                    "spx_return": -0.05,
+                    "vix_change": 0.22,
+                    "gold_return": 0.009,
+                    "crude_return": -0.01,
+                },
+            },
+            features={
+                "atr_percentile": 0.55,
+                "realized_vol": 0.45,
+                "bar_overlap": 0.24,
+                "directional_persistence": 0.78,
+                "breakout_follow_through": 0.76,
+                "spread_percentile": 0.21,
+                "directional_efficiency": 0.8,
+                "price_action_trend_score": 0.72,
+                "price_action_breakout_score": 0.71,
+            },
+        )
+    )
+
+    assert snapshot.label == "macro_risk_off_trend_fragile"
+    assert snapshot.score_vector["macro_risk_off"] > 0.67
+    assert snapshot.score_vector["usd_strength"] > 0.58
+    assert any(r.code == "macro_regime_confidence" for r in snapshot.rationale)
+
+
+def test_regime_engine_multimarket_defaults_when_context_missing() -> None:
+    engine = RegimeEngine()
+    snapshot = engine.compute(
+        EngineInput(
+            timestamp=datetime(2026, 1, 1),
+            instrument="GBPUSD",
+            trace_id="trace-mm-default",
+            bars=[],
+            context={"near_event": False},
+            features={"bar_overlap": 0.5, "directional_persistence": 0.5, "breakout_follow_through": 0.5},
+        )
+    )
+
+    assert 0.0 <= snapshot.score_vector["macro_risk_off"] <= 1.0
+    assert 0.0 <= snapshot.score_vector["macro_trend_support"] <= 1.0
+    assert 0.0 <= snapshot.score_vector["usd_strength"] <= 1.0

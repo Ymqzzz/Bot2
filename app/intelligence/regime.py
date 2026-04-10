@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from app.intelligence.base import EngineInput, clamp
 from app.intelligence.models import Evidence, RegimeState
+from app.intelligence.multimarket_regime import MultiMarketRegimeEngine
 
 
 class RegimeEngine:
+    def __init__(self) -> None:
+        self.multi_market = MultiMarketRegimeEngine()
+
     def compute(self, data: EngineInput) -> RegimeState:
         f = data.features
         atr_pct = clamp(float(f.get("atr_percentile", f.get("atr", 0.5))))
@@ -21,12 +25,13 @@ class RegimeEngine:
         pa_confidence = clamp(float(f.get("price_action_confidence", 0.5)))
         pa_id = int(float(f.get("price_action_id", 0.0)))
         near_event = 1.0 if data.context.get("near_event", False) else 0.0
+        macro = self.multi_market.compute(data)
 
-        trend = 0.35 * persistence + 0.25 * breakout_follow + 0.20 * (1.0 - overlap) + 0.20 * pa_trend
+        trend = 0.30 * persistence + 0.20 * breakout_follow + 0.15 * (1.0 - overlap) + 0.15 * pa_trend + 0.20 * macro.trend_support_score
         compression = 0.40 * (1.0 - atr_pct) + 0.25 * overlap + 0.20 * range_compression + 0.15 * pa_mean_revert
         chop = 0.35 * overlap + 0.25 * (1.0 - persistence) + 0.20 * (1.0 - breakout_follow) + 0.20 * (1.0 - directional_efficiency)
-        instability = 0.45 * near_event + 0.35 * spread_pct + 0.2 * realized_vol
-        expansion = 0.35 * atr_pct + 0.25 * breakout_follow + 0.15 * realized_vol + 0.25 * pa_breakout
+        instability = 0.30 * near_event + 0.25 * spread_pct + 0.15 * realized_vol + 0.30 * macro.risk_off_score
+        expansion = 0.30 * atr_pct + 0.20 * breakout_follow + 0.10 * realized_vol + 0.20 * pa_breakout + 0.20 * macro.trend_support_score
 
         score_vector = {
             "trend": clamp(trend),
@@ -35,15 +40,21 @@ class RegimeEngine:
             "post_event_instability": clamp(instability),
             "expansion": clamp(expansion),
             "range": clamp(0.40 * overlap + 0.35 * (1.0 - breakout_follow) + 0.25 * pa_mean_revert),
+            "macro_risk_off": macro.risk_off_score,
+            "macro_trend_support": macro.trend_support_score,
+            "usd_strength": macro.usd_strength_score,
         }
 
-        label = max(score_vector, key=score_vector.get)
+        primary_scores = {k: score_vector[k] for k in ("trend", "compression", "chop", "post_event_instability", "expansion", "range")}
+        label = max(primary_scores, key=primary_scores.get)
         if label == "trend" and trend < 0.55:
             label = "weak_trend"
         if label == "post_event_instability" and spread_pct > 0.8:
             label = "low_liquidity_instability"
         if breakout_follow > 0.72 and overlap < 0.35:
             label = "breakout_environment"
+        if macro.regime_label == "macro_risk_off_usd_bid" and label in {"trend", "weak_trend", "breakout_environment"}:
+            label = "macro_risk_off_trend_fragile"
         if pa_id == 3 and pa_confidence > 0.72 and expansion > 0.55:
             label = "algorithmic_breakout_expansion"
         elif pa_id == 2 and pa_confidence > 0.70 and compression > 0.50:
@@ -57,6 +68,7 @@ class RegimeEngine:
         pa_alignment = max(0.0, 1.0 - abs(pa_trend - score_vector["trend"]) - abs(pa_breakout - score_vector["expansion"]) * 0.5)
         confidence = clamp(0.35 + 0.40 * margin + 0.15 * stability + 0.10 * pa_alignment)
         rationale = [
+            Evidence("macro_regime_confidence", 0.15, macro.confidence, macro.regime_label),
             Evidence("atr_percentile", 0.20, atr_pct, "volatility regime input"),
             Evidence("bar_overlap", 0.20, overlap, "range/chop discriminator"),
             Evidence("directional_persistence", 0.20, persistence, "trend discriminator"),
