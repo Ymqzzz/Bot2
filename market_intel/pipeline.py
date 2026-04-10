@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from time import perf_counter
+from time import perf_counter, sleep, time
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from .models import MarketIntelSnapshot, ProviderStatus, SessionContext
@@ -51,6 +51,8 @@ class DependencyOrderedMarketIntelPipeline:
         self.feature_builder = feature_builder or self._default_feature_builder
         self.quality_builder = quality_builder or self._default_quality_builder
         self.providers: Dict[str, Callable[[str, datetime, dict], Any]] = dict(providers or {})
+        self._provider_failure_streak: Dict[str, int] = {}
+        self._provider_cooldown_until: Dict[str, float] = {}
 
     @staticmethod
     def _default_feature_builder(bars: list[dict] | None = None, ticks: list[dict] | None = None, **_: Any) -> dict[str, Any]:
@@ -139,6 +141,11 @@ class DependencyOrderedMarketIntelPipeline:
         runtime_context = runtime_context or {}
         strict_mode = bool(runtime_context.get("strict_mode", False))
         strict_dependencies = set(runtime_context.get("strict_dependencies", []))
+        retry_attempts = max(1, int(runtime_context.get("provider_retry_attempts", 2)))
+        retry_backoff_ms = max(0, int(runtime_context.get("provider_backoff_ms", 50)))
+        cb_threshold = max(1, int(runtime_context.get("provider_circuit_breaker_threshold", 3)))
+        cb_cooldown_s = max(1, int(runtime_context.get("provider_circuit_breaker_cooldown_s", 30)))
+        latency_warn_ms = max(1, int(runtime_context.get("provider_latency_warning_ms", 250)))
 
         state: Dict[str, Any] = {
             "session": SessionContext(instrument=instrument, asof=asof),
@@ -157,26 +164,65 @@ class DependencyOrderedMarketIntelPipeline:
             if provider is None:
                 self._register_failure(state, dep, dep_is_strict, reason="provider_not_configured", raise_on_fail=dep_is_strict)
                 continue
-            started = perf_counter()
-            try:
-                result = provider(instrument, asof, runtime_context)
-            except Exception as exc:  # noqa: BLE001
-                elapsed_ms = (perf_counter() - started) * 1000.0
+            cooldown_until = self._provider_cooldown_until.get(dep.provider_key, 0.0)
+            if cooldown_until > time():
                 self._register_failure(
                     state,
                     dep,
                     dep_is_strict,
-                    reason=f"{type(exc).__name__}: {exc}",
+                    reason=f"circuit_open_until:{datetime.utcfromtimestamp(cooldown_until).isoformat()}",
+                    raise_on_fail=dep_is_strict,
+                )
+                continue
+            result, elapsed_ms, error_reason = self._call_provider_with_retry(
+                provider=provider,
+                instrument=instrument,
+                asof=asof,
+                runtime_context=runtime_context,
+                attempts=retry_attempts,
+                backoff_ms=retry_backoff_ms,
+            )
+            if error_reason is not None:
+                streak = self._provider_failure_streak.get(dep.provider_key, 0) + 1
+                self._provider_failure_streak[dep.provider_key] = streak
+                if streak >= cb_threshold:
+                    self._provider_cooldown_until[dep.provider_key] = time() + cb_cooldown_s
+                self._register_failure(
+                    state,
+                    dep,
+                    dep_is_strict,
+                    reason=error_reason,
                     latency_ms=elapsed_ms,
                     raise_on_fail=dep_is_strict,
                 )
                 continue
+
+            self._provider_failure_streak[dep.provider_key] = 0
+            self._provider_cooldown_until.pop(dep.provider_key, None)
             state[dep.field] = result
+            status_reason = None
+            if elapsed_ms is not None and elapsed_ms > latency_warn_ms:
+                status_reason = f"latency_warning:{elapsed_ms:.2f}ms"
             state["provider_status"].append(
-                ProviderStatus(provider=dep.provider_key, ok=True, latency_ms=(perf_counter() - started) * 1000.0, strict=dep_is_strict)
+                ProviderStatus(
+                    provider=dep.provider_key,
+                    ok=True,
+                    latency_ms=elapsed_ms,
+                    reason=status_reason,
+                    strict=dep_is_strict,
+                )
             )
 
         state["metadata"]["build_finished_at"] = datetime.utcnow().isoformat()
+        ok_count = sum(1 for status in state["provider_status"] if status.ok)
+        total = len(state["provider_status"])
+        state["metadata"]["connectivity"] = {
+            "ok_providers": ok_count,
+            "failed_providers": max(0, total - ok_count),
+            "availability_ratio": (ok_count / total) if total else 1.0,
+            "retry_attempts": retry_attempts,
+            "circuit_breaker_threshold": cb_threshold,
+        }
         return MarketIntelSnapshot(
             session=state["session"],
             provider_status=state["provider_status"],
@@ -191,6 +237,31 @@ class DependencyOrderedMarketIntelPipeline:
             features=state.get("features", []),
             metadata=state["metadata"],
         )
+
+    @staticmethod
+    def _call_provider_with_retry(
+        provider: Callable[[str, datetime, dict], Any],
+        instrument: str,
+        asof: datetime,
+        runtime_context: dict[str, Any],
+        *,
+        attempts: int,
+        backoff_ms: int,
+    ) -> tuple[Any | None, float | None, str | None]:
+        elapsed_ms: float | None = None
+        for attempt in range(1, attempts + 1):
+            started = perf_counter()
+            try:
+                result = provider(instrument, asof, runtime_context)
+                elapsed_ms = (perf_counter() - started) * 1000.0
+                return result, elapsed_ms, None
+            except Exception as exc:  # noqa: BLE001
+                elapsed_ms = (perf_counter() - started) * 1000.0
+                if attempt >= attempts:
+                    return None, elapsed_ms, f"{type(exc).__name__}: {exc} [attempts={attempts}]"
+                if backoff_ms > 0:
+                    sleep((backoff_ms / 1000.0) * attempt)
+        return None, elapsed_ms, "unknown_error"
 
     def _register_failure(
         self,
