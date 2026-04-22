@@ -48,6 +48,15 @@ def test_compute_price_features_emits_rich_runtime_keys() -> None:
         "range_compression",
         "impulse_strength",
         "pullback_quality",
+        "rsi_14",
+        "macd",
+        "macd_signal",
+        "macd_hist",
+        "bb_pos",
+        "bb_bandwidth",
+        "algo_trend_strength",
+        "algo_mean_revert_strength",
+        "algo_breakout_strength",
     ):
         assert key in feats
 
@@ -63,3 +72,9 @@ def test_compute_price_features_emits_rich_runtime_keys() -> None:
     assert 0.0 <= feats["range_compression"] <= 1.0
     assert 0.0 <= feats["impulse_strength"] <= 1.0
     assert 0.0 <= feats["pullback_quality"] <= 1.0
+    assert 0.0 <= feats["rsi_14"] <= 100.0
+    assert 0.0 <= feats["bb_pos"] <= 1.0
+    assert feats["bb_bandwidth"] >= 0.0
+    assert 0.0 <= feats["algo_trend_strength"] <= 1.0
+    assert 0.0 <= feats["algo_mean_revert_strength"] <= 1.0
+    assert 0.0 <= feats["algo_breakout_strength"] <= 1.0
