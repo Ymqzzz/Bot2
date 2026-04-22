@@ -84,6 +84,60 @@ def _vwap_distance(bars: list[dict], window: int = 30) -> float:
     return _safe_div(close - vwap, vwap)
 
 
+def _rsi(closes: list[float], period: int = 14) -> float:
+    if len(closes) <= period:
+        return 50.0
+    gains = 0.0
+    losses = 0.0
+    for i in range(len(closes) - period, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        if delta >= 0:
+            gains += delta
+        else:
+            losses += -delta
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss <= 1e-12:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _macd(closes: list[float], fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> tuple[float, float, float]:
+    if len(closes) < slow_period + signal_period:
+        return 0.0, 0.0, 0.0
+    ema_fast_series: list[float] = []
+    ema_slow_series: list[float] = []
+    alpha_fast = 2.0 / (fast_period + 1.0)
+    alpha_slow = 2.0 / (slow_period + 1.0)
+    ef = closes[0]
+    es = closes[0]
+    for c in closes:
+        ef = alpha_fast * c + (1.0 - alpha_fast) * ef
+        es = alpha_slow * c + (1.0 - alpha_slow) * es
+        ema_fast_series.append(ef)
+        ema_slow_series.append(es)
+    macd_series = [f - s for f, s in zip(ema_fast_series, ema_slow_series)]
+    signal = _ema(macd_series[-(signal_period * 3) :], signal_period)
+    macd = macd_series[-1]
+    hist = macd - signal
+    return macd, signal, hist
+
+
+def _bollinger_position(closes: list[float], period: int = 20, stdev_mult: float = 2.0) -> tuple[float, float]:
+    if len(closes) < period:
+        return 0.5, 0.0
+    window = closes[-period:]
+    mean = statistics.fmean(window)
+    stdev = statistics.pstdev(window)
+    upper = mean + stdev_mult * stdev
+    lower = mean - stdev_mult * stdev
+    width = max(upper - lower, 1e-9)
+    pos = _safe_div(closes[-1] - lower, width, default=0.5)
+    bandwidth = _safe_div(width, max(mean, 1e-9))
+    return max(0.0, min(1.0, pos)), max(0.0, bandwidth)
+
+
 def compute_price_features(bars: list[dict]) -> dict:
     closes = [float(b["close"]) for b in bars]
     highs = [float(b["high"]) for b in bars]
@@ -125,6 +179,15 @@ def compute_price_features(bars: list[dict]) -> dict:
             "range_compression": 0.0,
             "impulse_strength": 0.0,
             "pullback_quality": 0.0,
+            "rsi_14": 50.0,
+            "macd": 0.0,
+            "macd_signal": 0.0,
+            "macd_hist": 0.0,
+            "bb_pos": 0.5,
+            "bb_bandwidth": 0.0,
+            "algo_trend_strength": 0.0,
+            "algo_mean_revert_strength": 0.0,
+            "algo_breakout_strength": 0.0,
         }
     ema_fast = _ema(closes[-40:], 10)
     ema_slow = _ema(closes[-60:], 30)
@@ -204,6 +267,31 @@ def compute_price_features(bars: list[dict]) -> dict:
     range_compression = max(0.0, min(1.0, _safe_div(atr, current_close) * 250.0))
     impulse_strength = max(0.0, min(1.0, _safe_div(abs(momentum), 2.5) * (0.7 + 0.3 * trend_regime)))
     pullback_quality = max(0.0, min(1.0, trend_regime * (1.0 - min(1.0, abs(zscore) / 2.2))))
+    rsi_14 = _rsi(closes, period=14)
+    macd, macd_signal, macd_hist = _macd(closes)
+    bb_pos, bb_bandwidth = _bollinger_position(closes, period=20, stdev_mult=2.0)
+    rsi_centered = abs(rsi_14 - 50.0) / 50.0
+    algo_trend_strength = max(
+        0.0,
+        min(
+            1.0,
+            0.45 * trend_strength + 0.25 * directional_efficiency + 0.15 * min(1.0, abs(macd_hist) / max(atr, 1e-9)) + 0.15 * rsi_centered,
+        ),
+    )
+    algo_mean_revert_strength = max(
+        0.0,
+        min(
+            1.0,
+            0.40 * min(1.0, abs(zscore) / 3.0) + 0.30 * (1.0 - directional_efficiency) + 0.20 * (1.0 - trend_strength) + 0.10 * abs(bb_pos - 0.5) * 2.0,
+        ),
+    )
+    algo_breakout_strength = max(
+        0.0,
+        min(
+            1.0,
+            0.35 * breakout_pressure + 0.25 * min(1.0, bb_bandwidth * 30.0) + 0.20 * bos + 0.20 * min(1.0, abs(macd_hist) / max(atr, 1e-9)),
+        ),
+    )
 
     return {
         "ema_fast": ema_fast,
@@ -241,4 +329,13 @@ def compute_price_features(bars: list[dict]) -> dict:
         "range_compression": range_compression,
         "impulse_strength": impulse_strength,
         "pullback_quality": pullback_quality,
+        "rsi_14": rsi_14,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "macd_hist": macd_hist,
+        "bb_pos": bb_pos,
+        "bb_bandwidth": bb_bandwidth,
+        "algo_trend_strength": algo_trend_strength,
+        "algo_mean_revert_strength": algo_mean_revert_strength,
+        "algo_breakout_strength": algo_breakout_strength,
     }
