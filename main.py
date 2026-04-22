@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+import importlib
 import math
+import os
 from statistics import NormalDist, fmean, pstdev
 import time
 from typing import Any
@@ -26,6 +28,38 @@ daily_trade_budget: dict[str, int] = {"trades_opened_today": 0}
 spread_cache: dict[str, float] = {}
 spread_history: defaultdict[str, list[tuple[float, float]]] = defaultdict(list)
 strategy_return_history: deque[float] = deque(maxlen=252)
+
+DEFAULT_STARTUP_MODULES: tuple[str, ...] = (
+    "dashboard",
+    "ui_dashboard",
+    "execution_engine",
+    "lifecycle_manager",
+    "portfolio_risk",
+    "world_state",
+    "reporting",
+    "edge_health",
+    "director_llm",
+)
+
+_startup_modules_loaded = False
+
+
+def _configured_startup_modules() -> tuple[str, ...]:
+    raw = (os.getenv("STARTUP_MODULES", "") or "").strip()
+    if not raw:
+        return DEFAULT_STARTUP_MODULES
+    modules = tuple(entry.strip() for entry in raw.split(",") if entry.strip())
+    return modules or DEFAULT_STARTUP_MODULES
+
+
+def run_startup_initializers() -> None:
+    """Import configured modules once so standalone utilities are initialized at boot."""
+    global _startup_modules_loaded
+    if _startup_modules_loaded:
+        return
+    for module_name in _configured_startup_modules():
+        importlib.import_module(module_name)
+    _startup_modules_loaded = True
 
 
 def safe_get(*_args, **_kwargs):
@@ -305,4 +339,5 @@ class RuntimeBootstrap:
 
 
 def build_runtime() -> RuntimeBootstrap:
+    run_startup_initializers()
     return RuntimeBootstrap()
